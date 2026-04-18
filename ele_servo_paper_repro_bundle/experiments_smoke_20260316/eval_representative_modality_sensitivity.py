@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from dataclasses import dataclass
+from pathlib import Path
+import sys
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from experiments_smoke_20260316.exp1_decoupled_models import Stage2DecoupledClassifier
+from experiments_smoke_20260316.train_exp1_decoupled_stages import (
+    DecoupledDataset,
+    apply_feature_mode,
+    apply_normalization,
+    batch_input_dims,
+    collate_decoupled_batch,
+    compute_normalization_stats,
+    load_decoupled_arrays,
+    move_batch_to_device,
+    stratified_split_three_way,
+)
+
+REPRESENTATIVE_SCENARIOS = {
+    "bearing_defect": {
+        "expected_dominant_modality": "vibration",
+        "motivation": "轴承缺陷通常首先在振动相关观测中表现出更明显异常。",
+    },
+    "inverter_voltage_loss": {
+        "expected_dominant_modality": "electrical",
+        "motivation": "逆变器侧电压损失通常首先影响电气侧响应。",
+    },
+    "thermal_saturation": {
+        "expected_dominant_modality": "thermal",
+        "motivation": "热饱和场景通常需要电气-热联合观察，其中热模态可作为重点敏感模态。",
+    },
+}
+
+MODALITY_TO_BATCH_FIELD = {
+    "pos": "pos",
+    "electrical": "electrical",
+    "thermal": "thermal",
+    "vibration": "vibration",
+}
+
+DISPLAY_MODALITY_ORDER = ["pos", "electrical", "thermal", "vibration"]
+
+
+@dataclass
+class SensitivityRow:
+    index: int
+    scenario: str
+    modality: str
+    full_logit: float
+    ablated_logit: float
+    delta: float
+    predicted_scenario: str
+    expected_dominant_modality: str
+
+
+def build_stage2_model(checkpoint_path: Path, input_dims: dict[str, int], num_classes: int, device: torch.device):
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    cfg = payload["config"]
+    model = Stage2DecoupledClassifier(
+        input_dims=input_dims,
+        num_classes=num_classes,
+        model_dim=int(cfg["model_dim"]),
+        token_dim=int(cfg["token_dim"]),
+        num_layers=int(cfg["fusion_layers"]),
+        nhead=int(cfg["fusion_heads"]),
+        dim_feedforward=int(cfg["fusion_ff"]),
+        pool=str(cfg["pool"]),
+    )
+    state = payload.get("model") or payload.get("model_state") or payload.get("state_dict")
+    if state is None:
+        raise KeyError(f"Checkpoint {checkpoint_path} does not contain model weights.")
+    model.load_state_dict(state, strict=False)
+    model.to(device)
+    model.eval()
+    return model, cfg
+
+
+def clone_with_zeroed_modality(batch, modality_name: str):
+    field = MODALITY_TO_BATCH_FIELD[modality_name]
+    kwargs = {
+        "pos": batch.pos.clone(),
+        "electrical": batch.electrical.clone(),
+        "thermal": batch.thermal.clone(),
+        "vibration": batch.vibration.clone(),
+        "y_cls": batch.y_cls.clone(),
+    }
+    kwargs[field] = torch.zeros_like(kwargs[field])
+    return type(batch)(**kwargs)
+
+
+def summarize_rows(rows: list[SensitivityRow]) -> list[dict[str, object]]:
+    summary: list[dict[str, object]] = []
+    by_scenario: dict[str, list[SensitivityRow]] = {}
+    for row in rows:
+        by_scenario.setdefault(row.scenario, []).append(row)
+
+    for scenario, scenario_rows in by_scenario.items():
+        grouped: dict[str, list[float]] = {}
+        expected = scenario_rows[0].expected_dominant_modality
+        for row in scenario_rows:
+            grouped.setdefault(row.modality, []).append(row.delta)
+
+        modality_means = {
+            modality: float(np.mean(values)) if values else 0.0
+            for modality, values in grouped.items()
+        }
+        dominant = max(modality_means.items(), key=lambda item: item[1])[0] if modality_means else ""
+        summary.append(
+            {
+                "scenario": scenario,
+                "num_correct_samples": len({row.index for row in scenario_rows}),
+                "expected_dominant_modality": expected,
+                "observed_dominant_modality": dominant,
+                "expected_matches_observed": int(dominant == expected),
+                "mean_delta_pos": modality_means.get("pos", 0.0),
+                "mean_delta_electrical": modality_means.get("electrical", 0.0),
+                "mean_delta_thermal": modality_means.get("thermal", 0.0),
+                "mean_delta_vibration": modality_means.get("vibration", 0.0),
+            }
+        )
+
+    summary.sort(key=lambda item: item["scenario"])
+    return summary
+
+
+def write_markdown_report(path: Path, summary_rows: list[dict[str, object]], used_feature_mode: str) -> None:
+    lines: list[str] = []
+    lines.append("# 代表性故障模态敏感性案例分析\n")
+    lines.append(f"- 使用特征模式：`{used_feature_mode}`")
+    lines.append("- 仅统计测试集中**预测正确**且属于代表性故障的样本。")
+    lines.append("- 指标 `delta = 完整输入下真实类别 logit - 删减某模态后的真实类别 logit`。")
+    lines.append("- `delta` 越大，说明该故障对该模态越敏感。\n")
+    lines.append("| 故障场景 | 正确样本数 | 预期重点模态 | 观察到的最敏感模态 | 是否一致 | pos | electrical | thermal | vibration |")
+    lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|")
+    for row in summary_rows:
+        lines.append(
+            "| {scenario} | {num_correct_samples} | {expected_dominant_modality} | {observed_dominant_modality} | {expected_matches_observed} | "
+            "{mean_delta_pos:.4f} | {mean_delta_electrical:.4f} | {mean_delta_thermal:.4f} | {mean_delta_vibration:.4f} |".format(**row)
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate representative fault modality sensitivity with stage-2 checkpoint.")
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=PROJECT_ROOT / "derived_datasets" / "servo_multimodal_handoff_dataset.npz",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=PROJECT_ROOT / "experiments_smoke_20260316" / "reports" / "representative_modality_sensitivity",
+    )
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
+    parser.add_argument("--feature-mode", type=str, default="", help="Override feature mode if checkpoint config lacks it.")
+    args = parser.parse_args()
+
+    torch.manual_seed(int(args.seed))
+    np.random.seed(int(args.seed))
+
+    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
+
+    arrays, _ = load_decoupled_arrays(args.dataset, None, int(args.max_samples))
+
+    # Read checkpoint config first so evaluation uses the same feature mode as training.
+    payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    cfg = payload.get("config", {})
+    checkpoint_feature_mode = str(cfg.get("feature_mode", "")).strip()
+    used_feature_mode = args.feature_mode.strip() or checkpoint_feature_mode or "base"
+
+    arrays, _ = apply_feature_mode(arrays, used_feature_mode, chunk_size=2048)
+    labels = arrays["y_cls"].astype(np.int64)
+    train_idx, _, test_idx = stratified_split_three_way(labels, float(args.val_ratio), float(args.test_ratio), int(args.seed))
+    stats = compute_normalization_stats(arrays, train_idx)
+    normalized = apply_normalization(arrays, stats)
+
+    base_dataset = DecoupledDataset(normalized, np.arange(labels.shape[0], dtype=np.int64))
+    input_dims = batch_input_dims(base_dataset[0])
+    class_names = [str(name) for name in arrays["class_names"].astype(str).tolist()]
+
+    model, _ = build_stage2_model(args.checkpoint, input_dims, len(class_names), device)
+
+    test_loader = DataLoader(
+        DecoupledDataset(normalized, test_idx),
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_decoupled_batch,
+    )
+
+    rows: list[SensitivityRow] = []
+    sample_indices = test_idx.astype(np.int64).tolist()
+
+    with torch.no_grad():
+        for local_idx, batch in enumerate(test_loader):
+            global_index = int(sample_indices[local_idx])
+            batch = move_batch_to_device(batch, device)
+            outputs = model(batch)
+            logits = outputs.logits
+            target_index = int(batch.y_cls.item())
+            predicted_index = int(logits.argmax(dim=1).item())
+
+            scenario_name = class_names[target_index]
+            predicted_name = class_names[predicted_index]
+
+            if scenario_name not in REPRESENTATIVE_SCENARIOS:
+                continue
+            if predicted_index != target_index:
+                continue
+
+            full_logit = float(logits[0, target_index].item())
+            expected_modality = str(REPRESENTATIVE_SCENARIOS[scenario_name]["expected_dominant_modality"])
+
+            for modality_name in DISPLAY_MODALITY_ORDER:
+                ablated_batch = clone_with_zeroed_modality(batch, modality_name)
+                ablated_outputs = model(ablated_batch)
+                ablated_logit = float(ablated_outputs.logits[0, target_index].item())
+                rows.append(
+                    SensitivityRow(
+                        index=global_index,
+                        scenario=scenario_name,
+                        modality=modality_name,
+                        full_logit=full_logit,
+                        ablated_logit=ablated_logit,
+                        delta=full_logit - ablated_logit,
+                        predicted_scenario=predicted_name,
+                        expected_dominant_modality=expected_modality,
+                    )
+                )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    per_sample_path = args.output_dir / "representative_modality_sensitivity_per_sample.csv"
+    with per_sample_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "index",
+                "scenario",
+                "modality",
+                "full_logit",
+                "ablated_logit",
+                "delta",
+                "predicted_scenario",
+                "expected_dominant_modality",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "index": row.index,
+                    "scenario": row.scenario,
+                    "modality": row.modality,
+                    "full_logit": f"{row.full_logit:.6f}",
+                    "ablated_logit": f"{row.ablated_logit:.6f}",
+                    "delta": f"{row.delta:.6f}",
+                    "predicted_scenario": row.predicted_scenario,
+                    "expected_dominant_modality": row.expected_dominant_modality,
+                }
+            )
+
+    summary_rows = summarize_rows(rows)
+    summary_path = args.output_dir / "representative_modality_sensitivity_summary.csv"
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "scenario",
+                "num_correct_samples",
+                "expected_dominant_modality",
+                "observed_dominant_modality",
+                "expected_matches_observed",
+                "mean_delta_pos",
+                "mean_delta_electrical",
+                "mean_delta_thermal",
+                "mean_delta_vibration",
+            ],
+        )
+        writer.writeheader()
+        for row in summary_rows:
+            out = dict(row)
+            for key in ["mean_delta_pos", "mean_delta_electrical", "mean_delta_thermal", "mean_delta_vibration"]:
+                out[key] = f"{float(out[key]):.6f}"
+            writer.writerow(out)
+
+    report = {
+        "model_checkpoint": str(args.checkpoint),
+        "dataset": str(args.dataset),
+        "feature_mode": used_feature_mode,
+        "representative_scenarios": REPRESENTATIVE_SCENARIOS,
+        "num_rows": len(rows),
+        "num_unique_correct_samples": len({row.index for row in rows}),
+        "summary": summary_rows,
+        "notes": [
+            "This is a lightweight case analysis rather than a strict physics-consistency validation.",
+            "Only correctly classified representative-fault samples are included.",
+        ],
+    }
+    report_path = args.output_dir / "report.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    markdown_path = args.output_dir / "report.md"
+    write_markdown_report(markdown_path, summary_rows, used_feature_mode)
+
+    print(f"per_sample={per_sample_path}")
+    print(f"summary={summary_path}")
+    print(f"report={report_path}")
+    print(f"markdown={markdown_path}")
+
+
+if __name__ == "__main__":
+    main()

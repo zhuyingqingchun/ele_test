@@ -1,0 +1,879 @@
+diff --git a/signal_prefix_qwen_reasoning_rag_20260402/code/experiments_smoke_20260316/eval_representative_modality_sensitivity.py b/signal_prefix_qwen_reasoning_rag_20260402/code/experiments_smoke_20260316/eval_representative_modality_sensitivity.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/signal_prefix_qwen_reasoning_rag_20260402/code/experiments_smoke_20260316/eval_representative_modality_sensitivity.py
+@@ -0,0 +1,368 @@
++from __future__ import annotations
+
++
+
++import argparse
+
++import csv
+
++import json
+
++import sys
+
++from dataclasses import dataclass, field
+
++from pathlib import Path
+
++from typing import Any
+
++
+
++import numpy as np
+
++import torch
+
++from torch.utils.data import DataLoader
+
++
+
++PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
++if str(PROJECT_ROOT) not in sys.path:
+
++    sys.path.insert(0, str(PROJECT_ROOT))
+
++
+
++from experiments_smoke_20260316.exp1_decoupled_models import Stage2DecoupledClassifier
+
++from experiments_smoke_20260316.train_exp1_decoupled_stages import (
+
++    DecoupledBatch,
+
++    DecoupledDataset,
+
++    apply_feature_mode,
+
++    apply_normalization,
+
++    batch_input_dims,
+
++    collate_decoupled_batch,
+
++    compute_normalization_stats,
+
++    load_decoupled_arrays,
+
++    move_batch_to_device,
+
++    stratified_split_three_way,
+
++)
+
++
+
++MODALITY_NAMES = ["pos", "electrical", "thermal", "vibration"]
+
++MODALITY_TO_BATCH_FIELD = {
+
++    "pos": "pos",
+
++    "electrical": "electrical",
+
++    "thermal": "thermal",
+
++    "vibration": "vibration",
+
++}
+
++DEFAULT_KEY_MODALITY_BY_SCENARIO = {
+
++    "bearing_defect": "vibration",
+
++    "inverter_voltage_loss": "electrical",
+
++    "thermal_saturation": "thermal",
+
++}
+
++
+
++
+
++@dataclass
+
++class ScenarioAccumulator:
+
++    total: int = 0
+
++    correct: int = 0
+
++    drops: dict[str, list[float]] = field(
+
++        default_factory=lambda: {name: [] for name in MODALITY_NAMES}
+
++    )
+
++
+
++
+
++def parse_name_list(raw: str) -> list[str]:
+
++    return [item.strip() for item in raw.split(",") if item.strip()]
+
++
+
++
+
++def read_checkpoint_config(checkpoint_path: Path) -> dict[str, Any]:
+
++    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
++    return dict(payload.get("config", {}))
+
++
+
++
+
++def zero_single_modality(batch: DecoupledBatch, modality: str) -> DecoupledBatch:
+
++    kwargs = {
+
++        "pos": batch.pos,
+
++        "electrical": batch.electrical,
+
++        "thermal": batch.thermal,
+
++        "vibration": batch.vibration,
+
++        "y_cls": batch.y_cls,
+
++    }
+
++    field_name = MODALITY_TO_BATCH_FIELD[modality]
+
++    kwargs[field_name] = torch.zeros_like(kwargs[field_name])
+
++    return DecoupledBatch(**kwargs)
+
++
+
++
+
++def build_stage2_model(
+
++    checkpoint_path: Path,
+
++    input_dims: dict[str, int],
+
++    num_classes: int,
+
++    device: torch.device,
+
++) -> tuple[Stage2DecoupledClassifier, dict[str, Any]]:
+
++    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
++    cfg = dict(payload.get("config", {}))
+
++    stage = int(cfg.get("stage", 2))
+
++    if stage != 2:
+
++        raise ValueError(
+
++            f"Lightweight modality sensitivity evaluation currently supports stage-2 checkpoints only; got stage={stage}."
+
++        )
+
++    model = Stage2DecoupledClassifier(
+
++        input_dims=input_dims,
+
++        num_classes=num_classes,
+
++        model_dim=int(cfg["model_dim"]),
+
++        token_dim=int(cfg["token_dim"]),
+
++        num_layers=int(cfg["fusion_layers"]),
+
++        nhead=int(cfg["fusion_heads"]),
+
++        dim_feedforward=int(cfg["fusion_ff"]),
+
++        pool=str(cfg.get("pool", "cls")),
+
++        quality_aware_fusion=bool(cfg.get("quality_aware_fusion", False)),
+
++        quality_hidden_dim=int(cfg.get("quality_hidden_dim", 128)),
+
++        modality_drop_prob=float(cfg.get("quality_drop_prob", 0.0)),
+
++        quality_min_gate=float(cfg.get("quality_min_gate", 0.10)),
+
++    )
+
++    state = payload.get("model") or payload.get("model_state") or payload.get("state_dict")
+
++    if state is None:
+
++        raise KeyError(f"Checkpoint {checkpoint_path} does not contain model weights.")
+
++    model.load_state_dict(state, strict=False)
+
++    model.to(device)
+
++    model.eval()
+
++    return model, cfg
+
++
+
++
+
++def mean_or_none(values: list[float]) -> float | None:
+
++    if not values:
+
++        return None
+
++    return float(np.mean(np.asarray(values, dtype=np.float32)))
+
++
+
++
+
++def format_float(value: float | None) -> str:
+
++    if value is None:
+
++        return "NA"
+
++    return f"{value:.4f}"
+
++
+
++
+
++def build_markdown_summary(
+
++    rows: list[dict[str, Any]],
+
++    output_path: Path,
+
++) -> None:
+
++    lines = [
+
++        "# 代表性故障模态敏感性案例分析",
+
++        "",
+
++        "本报告仅对机理边界较清晰的代表性故障开展案例分析，不将其作为全部故障的严格物理一致性验证。",
+
++        "",
+
++        "| 场景 | 预期关键模态 | 测试样本数 | 正确样本数 | 场景准确率 | position drop | electrical drop | thermal drop | vibration drop | 最敏感模态 | 与预期一致 |",
+
++        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
+
++    ]
+
++    for row in rows:
+
++        lines.append(
+
++            "| {scenario} | {expected_key_modality} | {total_samples} | {correct_samples} | {scenario_accuracy:.4f} | {mean_drop_pos} | {mean_drop_electrical} | {mean_drop_thermal} | {mean_drop_vibration} | {top_sensitive_modality} | {expected_match} |".format(
+
++                **row
+
++            )
+
++        )
+
++    lines.extend(
+
++        [
+
++            "",
+
++            "说明：",
+
++            "",
+
++            "- `drop` 表示在保持其余模态不变时，将某一模态置零后，真实类别 logit 的平均下降量；数值越大，说明该模态对该代表性故障更敏感。",
+
++            "- 仅统计测试集中被模型正确识别的样本，以减少错误预测对现象解释的干扰。",
+
++            "- 当最敏感模态与预期关键模态一致时，可将其作为正文中的支持性案例；若不一致，建议只保留趋势较稳定的案例。",
+
++        ]
+
++    )
+
++    output_path.write_text("\n".join(lines), encoding="utf-8")
+
++
+
++
+
++def main() -> None:
+
++    parser = argparse.ArgumentParser(
+
++        description="Evaluate lightweight representative-fault modality sensitivity for the stage-2 four-modality model."
+
++    )
+
++    parser.add_argument(
+
++        "--dataset",
+
++        type=Path,
+
++        default=PROJECT_ROOT / "derived_datasets" / "servo_multimodal_handoff_dataset.npz",
+
++    )
+
++    parser.add_argument(
+
++        "--checkpoint",
+
++        type=Path,
+
++        required=True,
+
++        help="Stage-2 checkpoint (best.pt) produced by the main four-modality experiment.",
+
++    )
+
++    parser.add_argument(
+
++        "--output-dir",
+
++        type=Path,
+
++        required=True,
+
++    )
+
++    parser.add_argument("--device", type=str, default="cuda")
+
++    parser.add_argument("--batch-size", type=int, default=32)
+
++    parser.add_argument("--seed", type=int, default=-1, help="Use negative value to follow checkpoint config.")
+
++    parser.add_argument("--max-samples", type=int, default=0)
+
++    parser.add_argument("--val-ratio", type=float, default=-1.0, help="Use negative value to follow checkpoint config.")
+
++    parser.add_argument("--test-ratio", type=float, default=-1.0, help="Use negative value to follow checkpoint config.")
+
++    parser.add_argument(
+
++        "--scenarios",
+
++        type=str,
+
++        default="bearing_defect,inverter_voltage_loss,thermal_saturation",
+
++        help="Comma-separated representative scenarios to analyze.",
+
++    )
+
++    parser.add_argument(
+
++        "--expected-key-modalities",
+
++        type=str,
+
++        default="bearing_defect:vibration,inverter_voltage_loss:electrical,thermal_saturation:thermal",
+
++        help="Comma-separated scenario:modality mapping.",
+
++    )
+
++    parser.add_argument("--feature-chunk-size", type=int, default=-1, help="Use negative value to follow checkpoint config.")
+
++    args = parser.parse_args()
+
++
+
++    torch.manual_seed(7)
+
++    np.random.seed(7)
+
++
+
++    cfg = read_checkpoint_config(args.checkpoint)
+
++    feature_mode = str(cfg.get("feature_mode", "base"))
+
++    feature_chunk_size = int(args.feature_chunk_size) if int(args.feature_chunk_size) > 0 else int(cfg.get("feature_chunk_size", 2048))
+
++
+
++    arrays, _ = load_decoupled_arrays(args.dataset, None, int(args.max_samples))
+
++    class_names = [str(item) for item in arrays["class_names"].astype(str).tolist()]
+
++    arrays, feature_meta = apply_feature_mode(arrays, feature_mode, chunk_size=feature_chunk_size)
+
++
+
++    labels = arrays["y_cls"].astype(np.int64)
+
++    split_seed = int(args.seed) if int(args.seed) >= 0 else int(cfg.get("seed", 7))
+
++    val_ratio = float(args.val_ratio) if float(args.val_ratio) >= 0.0 else float(cfg.get("val_ratio", 0.15))
+
++    test_ratio = float(args.test_ratio) if float(args.test_ratio) >= 0.0 else float(cfg.get("test_ratio", 0.15))
+
++    train_idx, _, test_idx = stratified_split_three_way(labels, val_ratio, test_ratio, split_seed)
+
++    stats = compute_normalization_stats(arrays, train_idx)
+
++    normalized = apply_normalization(arrays, stats)
+
++
+
++    test_dataset = DecoupledDataset(normalized, test_idx)
+
++    input_dims = batch_input_dims(test_dataset[0])
+
++
+
++    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
+
++    model, _ = build_stage2_model(args.checkpoint, input_dims, len(class_names), device)
+
++    test_loader = DataLoader(
+
++        test_dataset,
+
++        batch_size=int(args.batch_size),
+
++        shuffle=False,
+
++        collate_fn=collate_decoupled_batch,
+
++    )
+
++
+
++    scenario_names = parse_name_list(args.scenarios)
+
++    expected_key_modality = dict(DEFAULT_KEY_MODALITY_BY_SCENARIO)
+
++    for item in parse_name_list(args.expected_key_modalities):
+
++        if ":" not in item:
+
++            continue
+
++        scenario_name, modality_name = item.split(":", 1)
+
++        scenario_name = scenario_name.strip()
+
++        modality_name = modality_name.strip()
+
++        if scenario_name and modality_name in MODALITY_NAMES:
+
++            expected_key_modality[scenario_name] = modality_name
+
++
+
++    scenario_set = set(scenario_names)
+
++    accumulators = {name: ScenarioAccumulator() for name in scenario_names}
+
++    sample_rows: list[dict[str, Any]] = []
+
++
+
++    with torch.no_grad():
+
++        for batch in test_loader:
+
++            batch = move_batch_to_device(batch, device)
+
++            base_outputs = model(batch)
+
++            base_logits = base_outputs.logits.detach()
+
++            pred = base_logits.argmax(dim=1)
+
++
+
++            masked_logits_map: dict[str, torch.Tensor] = {}
+
++            for modality_name in MODALITY_NAMES:
+
++                masked_batch = zero_single_modality(batch, modality_name)
+
++                masked_outputs = model(masked_batch)
+
++                masked_logits_map[modality_name] = masked_outputs.logits.detach()
+
++
+
++            for row_idx in range(int(batch.y_cls.shape[0])):
+
++                target_idx = int(batch.y_cls[row_idx].item())
+
++                scenario_name = class_names[target_idx]
+
++                if scenario_name not in scenario_set:
+
++                    continue
+
++                acc = accumulators[scenario_name]
+
++                acc.total += 1
+
++                is_correct = int(pred[row_idx].item()) == target_idx
+
++                if not is_correct:
+
++                    continue
+
++                acc.correct += 1
+
++                base_logit = float(base_logits[row_idx, target_idx].item())
+
++                row_payload: dict[str, Any] = {
+
++                    "scenario": scenario_name,
+
++                    "target_index": target_idx,
+
++                    "baseline_true_logit": base_logit,
+
++                }
+
++                for modality_name in MODALITY_NAMES:
+
++                    masked_true_logit = float(masked_logits_map[modality_name][row_idx, target_idx].item())
+
++                    delta = base_logit - masked_true_logit
+
++                    acc.drops[modality_name].append(delta)
+
++                    row_payload[f"drop_{modality_name}"] = delta
+
++                sample_rows.append(row_payload)
+
++
+
++    summary_rows: list[dict[str, Any]] = []
+
++    for scenario_name in scenario_names:
+
++        acc = accumulators[scenario_name]
+
++        mean_drops = {modality_name: mean_or_none(acc.drops[modality_name]) for modality_name in MODALITY_NAMES}
+
++        valid_pairs = [(name, value) for name, value in mean_drops.items() if value is not None]
+
++        top_sensitive_modality = max(valid_pairs, key=lambda item: item[1])[0] if valid_pairs else "NA"
+
++        expected_key = expected_key_modality.get(scenario_name, "NA")
+
++        summary_rows.append(
+
++            {
+
++                "scenario": scenario_name,
+
++                "expected_key_modality": expected_key,
+
++                "total_samples": acc.total,
+
++                "correct_samples": acc.correct,
+
++                "scenario_accuracy": (float(acc.correct) / float(acc.total)) if acc.total > 0 else 0.0,
+
++                "mean_drop_pos": format_float(mean_drops["pos"]),
+
++                "mean_drop_electrical": format_float(mean_drops["electrical"]),
+
++                "mean_drop_thermal": format_float(mean_drops["thermal"]),
+
++                "mean_drop_vibration": format_float(mean_drops["vibration"]),
+
++                "top_sensitive_modality": top_sensitive_modality,
+
++                "expected_match": "yes" if expected_key == top_sensitive_modality else "no",
+
++            }
+
++        )
+
++
+
++    args.output_dir.mkdir(parents=True, exist_ok=True)
+
++    summary_csv = args.output_dir / "representative_modality_sensitivity_summary.csv"
+
++    sample_csv = args.output_dir / "representative_modality_sensitivity_per_sample.csv"
+
++    report_json = args.output_dir / "report.json"
+
++    report_md = args.output_dir / "report.md"
+
++
+
++    with summary_csv.open("w", encoding="utf-8", newline="") as f:
+
++        writer = csv.DictWriter(
+
++            f,
+
++            fieldnames=[
+
++                "scenario",
+
++                "expected_key_modality",
+
++                "total_samples",
+
++                "correct_samples",
+
++                "scenario_accuracy",
+
++                "mean_drop_pos",
+
++                "mean_drop_electrical",
+
++                "mean_drop_thermal",
+
++                "mean_drop_vibration",
+
++                "top_sensitive_modality",
+
++                "expected_match",
+
++            ],
+
++        )
+
++        writer.writeheader()
+
++        writer.writerows(summary_rows)
+
++
+
++    with sample_csv.open("w", encoding="utf-8", newline="") as f:
+
++        writer = csv.DictWriter(
+
++            f,
+
++            fieldnames=[
+
++                "scenario",
+
++                "target_index",
+
++                "baseline_true_logit",
+
++                "drop_pos",
+
++                "drop_electrical",
+
++                "drop_thermal",
+
++                "drop_vibration",
+
++            ],
+
++        )
+
++        writer.writeheader()
+
++        writer.writerows(sample_rows)
+
++
+
++    payload = {
+
++        "checkpoint": str(args.checkpoint),
+
++        "dataset": str(args.dataset),
+
++        "feature_mode": feature_meta,
+
++        "split_seed": split_seed,
+
++        "val_ratio": val_ratio,
+
++        "test_ratio": test_ratio,
+
++        "scenarios": scenario_names,
+
++        "summary_csv": str(summary_csv),
+
++        "per_sample_csv": str(sample_csv),
+
++        "summary_rows": summary_rows,
+
++    }
+
++    report_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
++    build_markdown_summary(summary_rows, report_md)
+
++
+
++    print(f"summary_csv={summary_csv}")
+
++    print(f"per_sample_csv={sample_csv}")
+
++    print(f"report_json={report_json}")
+
++    print(f"report_md={report_md}")
+
++
+
++
+
++if __name__ == "__main__":
+
++    main()
+
+diff --git a/signal_prefix_qwen_reasoning_rag_20260402/code/experiments_smoke_20260316/run_eval_representative_modality_sensitivity.sh b/signal_prefix_qwen_reasoning_rag_20260402/code/experiments_smoke_20260316/run_eval_representative_modality_sensitivity.sh
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/signal_prefix_qwen_reasoning_rag_20260402/code/experiments_smoke_20260316/run_eval_representative_modality_sensitivity.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
+
++set -euo pipefail
+
++
+
++PYTHON_PATH="${PYTHON_PATH:-python3}"
+
++DEVICE="${DEVICE:-cuda}"
+
++CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
++
+
++PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+
++cd "${PROJECT_ROOT}"
+
++
+
++export PYTHONUNBUFFERED=1
+
++export PYTHONPATH=.
+
++export CUDA_VISIBLE_DEVICES
+
++
+
++DATASET="${DATASET:-${PROJECT_ROOT}/derived_datasets/servo_multimodal_handoff_dataset.npz}"
+
++CHECKPOINT="${CHECKPOINT:-${PROJECT_ROOT}/experiments_smoke_20260316/models/exp1_decoupled_v3_modality_tf_control/stage2_signal_fusion/best.pt}"
+
++OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/experiments_smoke_20260316/models/representative_modality_sensitivity}"
+
++BATCH_SIZE="${BATCH_SIZE:-32}"
+
++SEED="${SEED:--1}"
+
++SCENARIOS="${SCENARIOS:-bearing_defect,inverter_voltage_loss,thermal_saturation}"
+
++EXPECTED_KEY_MODALITIES="${EXPECTED_KEY_MODALITIES:-bearing_defect:vibration,inverter_voltage_loss:electrical,thermal_saturation:thermal}"
+
++
+
++if [[ ! -f "${CHECKPOINT}" ]]; then
+
++  echo "Missing checkpoint: ${CHECKPOINT}" >&2
+
++  echo "Please set CHECKPOINT=/path/to/best.pt before running." >&2
+
++  exit 1
+
++fi
+
++
+
++"${PYTHON_PATH}" experiments_smoke_20260316/eval_representative_modality_sensitivity.py \
+
++  --dataset "${DATASET}" \
+
++  --checkpoint "${CHECKPOINT}" \
+
++  --output-dir "${OUTPUT_DIR}" \
+
++  --device "${DEVICE}" \
+
++  --batch-size "${BATCH_SIZE}" \
+
++  --seed "${SEED}" \
+
++  --scenarios "${SCENARIOS}" \
+
++  --expected-key-modalities "${EXPECTED_KEY_MODALITIES}" \
+
++  "$@"
+
+diff --git a/paper_repro_bundle_README.md b/paper_repro_bundle_README.md
+index 1111111..2222222
+--- a/paper_repro_bundle_README.md
++++ b/paper_repro_bundle_README.md
+@@ -73,6 +73,25 @@
+ bash experiments_smoke_20260316/run_compare_dual_branch_xattn_current_modalities.sh
+
+ ```
+
+ 
+
++### 6.5 运行代表性故障模态敏感性案例分析（可选）
+
++```bash
+
++bash experiments_smoke_20260316/run_eval_representative_modality_sensitivity.sh
+
++```
+
++
+
++该脚本默认基于主四模态实验得到的 `stage2` 最优 checkpoint，
+
++仅对 `bearing_defect`、`inverter_voltage_loss` 和 `thermal_saturation`
+
++三个代表性故障输出轻量级模态敏感性结果，生成：
+
++
+
++- `representative_modality_sensitivity_summary.csv`
+
++- `representative_modality_sensitivity_per_sample.csv`
+
++- `report.json`
+
++- `report.md`
+
++
+
++说明：
+
++- 该分析只作为正文中的补充案例，不作为全部故障的严格物理一致性验证。
+
++- 指标使用“删除某一模态后真实类别 logit 的平均下降量”来刻画模态敏感性。
+
++- 默认仅统计测试集中被模型正确识别的样本，以减少错误预测的干扰。
+
++
+
+ ### 7. 运行结构化诊断扩展实验
+
+ ```bash
+
+ export QWEN_PATH=/path/to/Qwen2.5-1.5B-Instruct
+
