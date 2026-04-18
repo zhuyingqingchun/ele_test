@@ -1,0 +1,227 @@
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_family_conditioned_evidence_router.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_family_conditioned_evidence_router.py
+--- a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_family_conditioned_evidence_router.py
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_family_conditioned_evidence_router.py
+@@
+-from __future__ import annotations
+-
+-import argparse
+-import json
+-import math
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import math
+@@
+-MODALITY_ORDER = ["pos", "electrical", "thermal", "vibration"]
++MODALITY_ORDER = ["pos", "electrical", "thermal", "vibration"]
+@@
+-REPRESENTATIVE_PRIORS = {
+-    "bearing_defect": {"pos": 0.10, "electrical": 0.15, "thermal": 0.05, "vibration": 0.70},
+-    "inverter_voltage_loss": {"pos": 0.10, "electrical": 0.65, "thermal": 0.10, "vibration": 0.15},
+-    "thermal_saturation": {"pos": 0.10, "electrical": 0.25, "thermal": 0.55, "vibration": 0.10},
+-    "winding_resistance_rise": {"pos": 0.10, "electrical": 0.65, "thermal": 0.15, "vibration": 0.10},
+-    "bus_voltage_sag_fault": {"pos": 0.10, "electrical": 0.70, "thermal": 0.10, "vibration": 0.10},
+-    "speed_sensor_scale": {"pos": 0.70, "electrical": 0.20, "thermal": 0.05, "vibration": 0.05},
+-    "current_sensor_bias": {"pos": 0.20, "electrical": 0.70, "thermal": 0.05, "vibration": 0.05},
+-}
++SCENARIO_MODALITY_EXPECTATIONS = {
++    "load_disturbance_mild": ["pos", "electrical", "vibration"],
++    "load_disturbance_severe": ["pos", "electrical", "vibration"],
++    "friction_wear_mild": ["pos", "electrical", "vibration"],
++    "friction_wear_severe": ["pos", "electrical", "vibration"],
++    "jam_fault": ["pos", "vibration", "electrical"],
++    "intermittent_jam_fault": ["vibration", "pos", "electrical"],
++    "current_sensor_bias": ["electrical", "pos", "thermal"],
++    "speed_sensor_scale": ["pos", "electrical", "vibration"],
++    "position_sensor_bias": ["pos", "electrical", "vibration"],
++    "winding_resistance_rise": ["electrical", "thermal", "pos"],
++    "bus_voltage_sag_fault": ["electrical", "pos", "thermal"],
++    "backlash_growth": ["pos", "vibration", "electrical"],
++    "thermal_saturation": ["thermal", "electrical", "pos"],
++    "motor_encoder_freeze": ["pos", "electrical", "vibration"],
++    "partial_demagnetization": ["electrical", "pos", "thermal"],
++    "inverter_voltage_loss": ["electrical", "vibration", "pos"],
++    "bearing_defect": ["vibration", "electrical", "pos"],
++}
++
++RANK_TO_WEIGHT = [0.62, 0.23, 0.10, 0.05]
+@@
+-def build_prior_matrix(class_names: list[str]) -> tuple[Tensor, Tensor]:
++def build_prior_matrix(class_names: list[str]) -> tuple[Tensor, Tensor]:
+     priors = []
+     mask = []
+     for name in class_names:
+-        if name in REPRESENTATIVE_PRIORS:
+-            priors.append([float(REPRESENTATIVE_PRIORS[name][m]) for m in MODALITY_ORDER])
++        if name in SCENARIO_MODALITY_EXPECTATIONS:
++            ranked = SCENARIO_MODALITY_EXPECTATIONS[name]
++            weights = {m: RANK_TO_WEIGHT[-1] for m in MODALITY_ORDER}
++            for idx, modality in enumerate(ranked[:3]):
++                weights[modality] = RANK_TO_WEIGHT[idx]
++            priors.append([float(weights[m]) for m in MODALITY_ORDER])
+             mask.append(1.0)
+         else:
+             priors.append([0.25, 0.25, 0.25, 0.25])
+             mask.append(0.0)
+     return torch.tensor(priors, dtype=torch.float32), torch.tensor(mask, dtype=torch.float32)
+@@
+-    rep_buckets: dict[str, list[np.ndarray]] = {name: [] for name in REPRESENTATIVE_PRIORS}
++    rep_buckets: dict[str, list[np.ndarray]] = {name: [] for name in SCENARIO_MODALITY_EXPECTATIONS}
+@@
+-    top1_hits = 0
+-    top2_hits = 0
++    top1_hits = 0
++    top2_hits = 0
++    top3_hits = 0
+     valid = 0
+     for scenario_name, items in rep_buckets.items():
+         if not items:
+             continue
+         valid += 1
+         mean_weights = np.mean(np.stack(items, axis=0), axis=0)
+         top_order = np.argsort(mean_weights)[::-1]
+-        expected = max(REPRESENTATIVE_PRIORS[scenario_name].items(), key=lambda kv: kv[1])[0]
++        expected_rank = SCENARIO_MODALITY_EXPECTATIONS[scenario_name]
++        expected = expected_rank[0]
+         observed_top1 = MODALITY_ORDER[int(top_order[0])]
+         observed_top2 = [MODALITY_ORDER[int(i)] for i in top_order[:2].tolist()]
++        observed_top3 = [MODALITY_ORDER[int(i)] for i in top_order[:3].tolist()]
+         top1_ok = observed_top1 == expected
+         top2_ok = expected in observed_top2
++        top3_ok = expected in observed_top3
+         top1_hits += int(top1_ok)
+         top2_hits += int(top2_ok)
++        top3_hits += int(top3_ok)
+         details.append(
+             {
+                 "scenario": scenario_name,
+                 "num_correct_samples": len(items),
+-                "expected_modality": expected,
++                "expected_top1": expected_rank[0],
++                "expected_top2": expected_rank[1],
++                "expected_top3": expected_rank[2],
+                 "top1_modality": observed_top1,
+                 "top2_modalities": observed_top2,
++                "top3_modalities": observed_top3,
+                 "top1_consistent": bool(top1_ok),
+                 "top2_consistent": bool(top2_ok),
++                "top3_consistent": bool(top3_ok),
+                 "weights": {
+                     name: float(mean_weights[idx]) for idx, name in enumerate(MODALITY_ORDER)
+                 },
+             }
+         )
+@@
+         "category_accuracy": correct / max(1, total),
+         "loss": loss_sum / max(1, total),
+         "evidence_consistency_top1": top1_hits / max(1, valid),
+         "evidence_consistency_top2": top2_hits / max(1, valid),
+-        "representative_details": details,
++        "evidence_consistency_top3": top3_hits / max(1, valid),
++        "all_fault_details": details,
+     }
+@@
+-    report_md_path = args.output_dir / "report.md"
++    report_md_path = args.output_dir / "report.md"
++    report_csv_path = args.output_dir / "all_fault_evidence_consistency.csv"
+@@
+             "train_category_accuracy": train_acc,
+             "val_category_accuracy": float(val_metrics["category_accuracy"]),
+             "val_evidence_consistency_top1": float(val_metrics["evidence_consistency_top1"]),
+             "val_evidence_consistency_top2": float(val_metrics["evidence_consistency_top2"]),
++            "val_evidence_consistency_top3": float(val_metrics["evidence_consistency_top3"]),
+         }
+@@
+-        score = float(val_metrics["category_accuracy"]) + 0.02 * float(val_metrics["evidence_consistency_top1"])
++        score = (
++            float(val_metrics["category_accuracy"])
++            + 0.02 * float(val_metrics["evidence_consistency_top1"])
++            + 0.01 * float(val_metrics["evidence_consistency_top2"])
++        )
+@@
+         "model": "family_conditioned_evidence_router",
+         "category_accuracy": float(metrics["category_accuracy"]),
+         "loss": float(metrics["loss"]),
+         "evidence_consistency_top1": float(metrics["evidence_consistency_top1"]),
+         "evidence_consistency_top2": float(metrics["evidence_consistency_top2"]),
+-        "representative_details": metrics["representative_details"],
++        "evidence_consistency_top3": float(metrics["evidence_consistency_top3"]),
++        "all_fault_details": metrics["all_fault_details"],
+         "history": history,
+         "feature_mode": feature_meta,
+         "base_stage2": str(args.base_stage2),
+         "best_checkpoint": str(best_path),
+     }
+     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
++
++    with report_csv_path.open("w", encoding="utf-8", newline="") as f:
++        writer = csv.DictWriter(
++            f,
++            fieldnames=[
++                "scenario",
++                "num_correct_samples",
++                "expected_top1",
++                "expected_top2",
++                "expected_top3",
++                "top1_modality",
++                "top2_modalities",
++                "top3_modalities",
++                "top1_consistent",
++                "top2_consistent",
++                "top3_consistent",
++                "weight_pos",
++                "weight_electrical",
++                "weight_thermal",
++                "weight_vibration",
++            ],
++        )
++        writer.writeheader()
++        for item in report["all_fault_details"]:
++            writer.writerow(
++                {
++                    "scenario": item["scenario"],
++                    "num_correct_samples": item["num_correct_samples"],
++                    "expected_top1": item["expected_top1"],
++                    "expected_top2": item["expected_top2"],
++                    "expected_top3": item["expected_top3"],
++                    "top1_modality": item["top1_modality"],
++                    "top2_modalities": ", ".join(item["top2_modalities"]),
++                    "top3_modalities": ", ".join(item["top3_modalities"]),
++                    "top1_consistent": item["top1_consistent"],
++                    "top2_consistent": item["top2_consistent"],
++                    "top3_consistent": item["top3_consistent"],
++                    "weight_pos": item["weights"]["pos"],
++                    "weight_electrical": item["weights"]["electrical"],
++                    "weight_thermal": item["weights"]["thermal"],
++                    "weight_vibration": item["weights"]["vibration"],
++                }
++            )
+ 
+     lines = [
+-        "# Family-Conditioned Evidence Router",
++        "# Family-Conditioned Evidence Router",
+         "",
+         f"- 类别准确率: {report['category_accuracy'] * 100:.2f}%",
+         f"- 证据一致性 top-1: {report['evidence_consistency_top1'] * 100:.2f}%",
+         f"- 证据一致性 top-2: {report['evidence_consistency_top2'] * 100:.2f}%",
++        f"- 证据一致性 top-3: {report['evidence_consistency_top3'] * 100:.2f}%",
+         "",
+-        "| 故障场景 | 期望主导模态 | top-1 | top-2 | 一致性 |",
+-        "|---|---|---|---|---|",
++        "| 故障场景 | 期望 top-1 | 期望 top-2 | 期望 top-3 | 观察 top-1 | 观察 top-2 | 观察 top-3 | 一致性 |",
++        "|---|---|---|---|---|---|---|---|",
+     ]
+-    for item in report["representative_details"]:
++    for item in report["all_fault_details"]:
+         lines.append(
+-            f"| {item['scenario']} | {item['expected_modality']} | {item['top1_modality']} | "
+-            f"{', '.join(item['top2_modalities'])} | "
+-            f"top1={item['top1_consistent']}, top2={item['top2_consistent']} |"
++            f"| {item['scenario']} | {item['expected_top1']} | {item['expected_top2']} | {item['expected_top3']} | "
++            f"{item['top1_modality']} | {', '.join(item['top2_modalities'])} | {', '.join(item['top3_modalities'])} | "
++            f"top1={item['top1_consistent']}, top2={item['top2_consistent']}, top3={item['top3_consistent']} |"
+         )
+     report_md_path.write_text("\n".join(lines), encoding="utf-8")
+     print(f"report={report_path}")
