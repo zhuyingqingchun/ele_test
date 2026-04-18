@@ -1,0 +1,125 @@
+{
+  "fault_entries": [
+    {
+      "scenario": "load_disturbance_mild",
+      "family": "load_disturbance",
+      "location": "load_path",
+      "signals": ["torque_load_nm", "speed_residual_deg_s", "position_error_deg", "vibration_band_mps2"],
+      "mechanism": "Mild external load and gust torque raise tracking effort and produce coupled motion-residual deviation while remaining closer to the nominal operating envelope.",
+      "maintenance": [
+        "Inspect aerodynamic/load command mismatch.",
+        "Review disturbance observer tuning and load path margins."
+      ]
+    },
+    {
+      "scenario": "load_disturbance_severe",
+      "family": "load_disturbance",
+      "location": "load_path",
+      "signals": ["torque_load_nm", "theta_meas_deg", "speed_residual_deg_s", "current_q_meas_a"],
+      "mechanism": "Severe external torque drives sustained position and speed residual growth, pushing q-axis current demand upward and widening load-path deviation.",
+      "maintenance": [
+        "Check external load source and aerodynamic disturbance level.",
+        "Verify commanded motion envelope against actuator capability."
+      ]
+    },
+    {
+      "scenario": "friction_wear_severe",
+      "family": "friction_increase",
+      "location": "mechanical_transmission",
+      "signals": ["torque_friction_nm", "current_q_meas_a", "mechanical_power_w", "shaft_twist_deg"],
+      "mechanism": "Friction growth increases resisting torque, elevates current demand, and degrades mechanical transmission efficiency during reversals.",
+      "maintenance": [
+        "Inspect lubrication condition and gear train wear.",
+        "Check seal drag and transmission alignment."
+      ]
+    },
+    {
+      "scenario": "jam_fault",
+      "family": "jam",
+      "location": "mechanical_transmission",
+      "signals": ["theta_meas_deg", "shaft_twist_deg", "torque_shaft_nm", "current_residual_a"],
+      "mechanism": "A jam constrains load motion while the controller continues to build torque and current, causing rapid shaft twist and residual escalation.",
+      "maintenance": [
+        "Stop aggressive actuation and inspect linkage blockage immediately.",
+        "Check end-stop, gearbox and driven surface interference."
+      ]
+    },
+    {
+      "scenario": "position_sensor_bias",
+      "family": "sensor_fault",
+      "location": "sensor_chain",
+      "signals": ["theta_meas_deg", "position_error_deg", "encoder_count", "theta_motor_meas_deg"],
+      "mechanism": "Position sensing bias misaligns the outer-loop error calculation and induces incorrect correction effort even when mechanical motion remains feasible.",
+      "maintenance": [
+        "Recalibrate the load-side position sensor.",
+        "Cross-check sensor bias against motor encoder consistency."
+      ]
+    },
+    {
+      "scenario": "motor_encoder_freeze",
+      "family": "sensor_fault",
+      "location": "sensor_chain",
+      "signals": ["theta_motor_meas_deg", "theta_e_obs_deg", "speed_residual_deg_s", "phase_current_imbalance_est_a"],
+      "mechanism": "Frozen motor encoder feedback corrupts electrical angle observation and propagates into dq control mismatch and residual growth.",
+      "maintenance": [
+        "Inspect motor encoder communication and sampling path.",
+        "Verify electrical angle observer fallback logic."
+      ]
+    },
+    {
+      "scenario": "winding_resistance_rise",
+      "family": "electrical_fault",
+      "location": "electrical_drive",
+      "signals": ["current_q_meas_a", "copper_loss_w", "winding_temp_c", "available_bus_voltage_v"],
+      "mechanism": "Increased winding resistance raises copper loss and thermal stress, reducing current efficiency and tightening the available voltage-current margin.",
+      "maintenance": [
+        "Inspect winding insulation and connector integrity.",
+        "Review thermal derating thresholds and cooling path."
+      ]
+    },
+    {
+      "scenario": "partial_demagnetization",
+      "family": "electrical_fault",
+      "location": "electrical_drive",
+      "signals": ["back_emf_v", "current_q_meas_a", "mechanical_power_w", "phase_voltage_a_meas_v"],
+      "mechanism": "Flux linkage loss reduces back-EMF and torque constant, forcing higher current for the same mechanical output.",
+      "maintenance": [
+        "Inspect rotor magnetic health and thermal exposure history.",
+        "Compare torque constant estimate against nominal calibration."
+      ]
+    },
+    {
+      "scenario": "thermal_saturation",
+      "family": "electrical_fault",
+      "location": "thermal_management",
+      "signals": ["winding_temp_c", "housing_temp_c", "winding_temp_rate_c_s", "current_limit_a"],
+      "mechanism": "Thermal saturation raises winding temperature and triggers current derating, which then propagates to tracking degradation and electrical stress.",
+      "maintenance": [
+        "Inspect cooling path and housing heat rejection.",
+        "Reduce duty cycle and confirm temperature sensor calibration."
+      ]
+    },
+    {
+      "scenario": "backlash_growth",
+      "family": "mechanical_fault",
+      "location": "mechanical_transmission",
+      "signals": ["shaft_twist_deg", "theta_motor_meas_deg", "theta_meas_deg", "torque_shaft_nm"],
+      "mechanism": "Backlash enlarges dead-zone motion, creating encoder mismatch and torque transfer delay between motor and load sides.",
+      "maintenance": [
+        "Inspect gearbox backlash and coupler clearance.",
+        "Check reversal-region tracking for dead-zone compensation retuning."
+      ]
+    },
+    {
+      "scenario": "bearing_defect",
+      "family": "mechanical_fault",
+      "location": "mechanical_transmission",
+      "signals": ["vibration_accel_mps2", "vibration_envelope_mps2", "vibration_shock_index", "torque_friction_nm"],
+      "mechanism": "Bearing damage injects periodic impact and friction ripple, which appears first in vibration envelope and shock-sensitive channels.",
+      "maintenance": [
+        "Inspect bearing race and lubrication state.",
+        "Track vibration envelope progression under repeated missions."
+      ]
+    }
+  ]
+}

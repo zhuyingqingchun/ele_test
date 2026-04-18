@@ -1,0 +1,39 @@
+{
+  "bundle_name": "signal_prefix_qwen_reasoning_rag_20260402",
+  "bundle_root": "/mnt/PRO6000_disk/swd/ele_servo_gpt5/handoff_packages/signal_prefix_qwen_reasoning_rag_20260402",
+  "included": {
+    "raw_data": [
+      "raw_data/diagnostic_datasets"
+    ],
+    "derived_data": [
+      "derived_data/servo_multimodal_handoff_dataset.npz",
+      "derived_data/servo_multimodal_handoff_metadata.csv",
+      "derived_data/stage1_alignment_corpus.jsonl",
+      "derived_data/servo_handoff_manifest.json",
+      "derived_data/servo_window_handoff_dataset.npz",
+      "derived_data/servo_window_handoff_metadata.csv"
+    ],
+    "results": [
+      "results/report.json",
+      "results/test_reasoning_predictions.csv"
+    ],
+    "code": [
+      "code/src/run_servo_pipeline_expanded.py",
+      "code/src/build_servo_multimodal_dataset.py",
+      "code/src/build_servo_handoff_dataset.py",
+      "code/src/build_stage1_alignment_corpus.py",
+      "code/experiments_smoke_20260316/run_signal_prefix_qwen_reasoning.sh",
+      "code/experiments_smoke_20260316/train_signal_prefix_qwen_reasoning.py",
+      "code/experiments_smoke_20260316/train_signal_prefix_qwen_lora.py",
+      "code/experiments_smoke_20260316/train_exp1_decoupled_stages.py",
+      "code/servo_diagnostic",
+      "code/servo_llm_alignment"
+    ]
+  },
+  "sizes": {
+    "raw_data": "7.8G",
+    "derived_data": "5.1G",
+    "results": "14M",
+    "code": "1.9M"
+  }
+}

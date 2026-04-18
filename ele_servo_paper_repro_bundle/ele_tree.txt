@@ -1,0 +1,64 @@
+============================================
+ 目录统计报告: /mnt/PRO6000_disk/swd/ele_servo_new/ele_servo_paper_repro_bundle
+============================================
+
+📁 目录数量:    219
+📄 文件数量:    729
+🔗 符号链接:    0
+💾 总大小:      5.7G
+
+--------------------------------------------
+  按文件扩展名统计 (Top 20)
+--------------------------------------------
+  csv                  151
+  png                  145
+  py                   63
+  pyc                  27
+  json                 25
+  sh                   20
+  sample               14
+  pt                   6
+  npy                  6
+  md                   5
+  txt                  3
+  npz                  2
+  pack                 1
+  log                  1
+  jsonl                1
+  idx                  1
+  gitignore            1
+  git/refs/heads/master 1
+  git/objects/fe/ddf6f4f0ee7ea833cbdb547dcde0e2b57394e0 1
+  git/objects/fd/00ad5f7f2c06c533606d246247cbbc2780f463 1
+
+--------------------------------------------
+  一级子目录大小
+--------------------------------------------
+  ./diagnostic_datasets/                   2.3G
+  ./derived_datasets/                      1.7G
+  ./experiments_smoke_20260316/            451M
+  ./comparison_plots/                      64M
+  ./论文/                                1.5M
+  ./servo_diagnostic/                      692K
+  ./servo_llm_alignment/                   228K
+  ./model/                                 52K
+  ./src/                                   32K
+  ./handoff_packages/                      8.0K
+
+--------------------------------------------
+  最大文件 (Top 10)
+--------------------------------------------
+  ./derived_datasets/servo_multimodal_handoff_dataset.npz      1.2G
+  ./.git/objects/pack/pack-b5770aae317641a8f1dd9a27e996cd1ecb77cc4d.pack 1.2G
+  ./diagnostic_datasets/servo_fault_diagnosis_dataset_full.csv 796M
+  ./diagnostic_datasets/servo_fault_diagnosis_dataset_handoff.csv 751M
+  ./derived_datasets/servo_window_handoff_dataset.npz          460M
+  ./experiments_smoke_20260316/traditional/window_dataset/train/data.npy 182M
+  ./experiments_smoke_20260316/models/exp1_decoupled_v6_modality_tf_control_raw_thermal/stage4_signal_text_llm/text_embeddings__mock.pt 82M
+  ./experiments_smoke_20260316/models/exp1_decoupled_v6_modality_tf_control_raw_thermal/stage3_signal_text_align/text_embeddings__mock.pt 82M
+  ./derived_datasets/stage1_alignment_corpus.jsonl             52M
+  ./experiments_smoke_20260316/traditional/window_dataset/test/data.npy 40M
+
+============================================
+  统计完成
+============================================

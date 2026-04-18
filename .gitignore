@@ -1,0 +1,185 @@
+# =========================================================
+# ele_servo_new project .gitignore
+# 目标：
+# 1) 保留源码、脚本、README、requirements、论文正文与必要说明文件
+# 2) 忽略原始数据、派生数据、训练结果、模型权重、日志、缓存、环境文件
+# =========================================================
+
+# =========================
+# Git / OS metadata
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Editor / IDE
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# Python cache / build
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+site/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+conda_env/
+.python-version
+
+# =========================
+# Logs / runtime files
+# =========================
+*.log
+logs/
+log/
+tmp/
+temp/
+.cache/
+
+# =========================
+# Generic model / checkpoint / experiment outputs
+# =========================
+checkpoints/
+checkpoint/
+weights/
+runs/
+wandb/
+mlruns/
+tensorboard/
+events.out.tfevents.*
+
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.engine
+
+# =========================
+# Generic large data artifacts
+# 注意：这里不全局忽略 *.csv，避免误伤小型元数据文件
+# =========================
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.jsonl
+
+# =========================
+# Root-level large archives
+# =========================
+*.tar.gz
+*.tar
+*.zip
+*.7z
+
+# Nested git repos (avoid submodule conflicts)
+ele_servo_paper_repro_bundle/.git/
+
+# =========================================================
+# 目录 1:
+# signal_prefix_qwen_reasoning_rag_20260402
+# 保留 code/ 和 docs/，忽略 raw_data/ derived_data/ results/
+# =========================================================
+
+signal_prefix_qwen_reasoning_rag_20260402/raw_data/
+signal_prefix_qwen_reasoning_rag_20260402/derived_data/
+signal_prefix_qwen_reasoning_rag_20260402/results/
+
+# 若后续生成额外缓存，可继续加在这里
+signal_prefix_qwen_reasoning_rag_20260402/**/__pycache__/
+signal_prefix_qwen_reasoning_rag_20260402/**/*.pyc
+
+# =========================================================
+# 目录 2:
+# ele_servo_paper_repro_bundle
+# 保留源码、论文、README、requirements、图示说明
+# 忽略数据、模型、日志、对比输出
+# =========================================================
+
+# 数据集与派生数据
+ele_servo_paper_repro_bundle/diagnostic_datasets/
+ele_servo_paper_repro_bundle/derived_datasets/
+ele_servo_paper_repro_bundle/comparison_plots/
+
+# 运行日志
+ele_servo_paper_repro_bundle/pipeline_output.log
+
+# 实验产物 / 模型结果
+ele_servo_paper_repro_bundle/experiments_smoke_20260316/models/
+ele_servo_paper_repro_bundle/experiments_smoke_20260316/traditional/
+
+# 常见实验缓存
+ele_servo_paper_repro_bundle/**/__pycache__/
+ele_servo_paper_repro_bundle/**/*.pyc
+
+# =========================================================
+# 可选忽略项
+# 如果你确认论文图片都是"脚本可再生成"的，可以取消下面注释
+# 否则建议保留论文 figures 方便别人直接查看
+# =========================================================
+# ele_servo_paper_repro_bundle/论文/figures/
+
+# =========================================================
+# 可选忽略项
+# 如果某些 results/report/prediction 文件未来会反复生成且不想提交，可取消下面注释
+# 目前默认不全局忽略，避免误伤需要保留的小结果文件
+# =========================================================
+# results/
+# reports/
+# predictions/
+
+# =========================================================
+# 明确保留的重要源码/说明文件（说明性注释，不影响匹配）
+# 会被保留的典型内容包括：
+# - build_paper_repro_bundle.sh
+# - run_all_paper_pipeline.sh
+# - paper_repro_bundle_requirements.txt
+# - paper_repro_bundle_README.md
+# - paper_repro_bundle_manifest.txt
+# - signal_prefix_qwen_reasoning_rag_20260402/code/
+# - ele_servo_paper_repro_bundle/src/
+# - ele_servo_paper_repro_bundle/servo_diagnostic/
+# - ele_servo_paper_repro_bundle/servo_llm_alignment/
+# - ele_servo_paper_repro_bundle/model/
+# - ele_servo_paper_repro_bundle/handoff_packages/
+# - ele_servo_paper_repro_bundle/论文/paper.md
+# - ele_servo_paper_repro_bundle/项目拓扑图/
+# =========================================================

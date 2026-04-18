@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated data
+*.csv
+*.npy
+*.pkl
+*.joblib
+*.npz
+*.jsonl
+*.json
+derived_datasets/
+experiments_smoke_20260316/traditional/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+models/
+
+# Logs
+*.log
+pipeline_output.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Conda
+environment.yml
