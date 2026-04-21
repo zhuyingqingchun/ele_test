@@ -18,6 +18,8 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"
 SEED="${SEED:-7}"
 FEATURE_MODE="${FEATURE_MODE:-modality_tf}"
 GPU_MAP="${GPU_MAP:-0,1,2,3,0}"
+QUALITY_AWARE_FUSION="${QUALITY_AWARE_FUSION:-1}"
+MODALITY_DROP_PROB="${MODALITY_DROP_PROB:-0.0}"
 
 mkdir -p "${ROOT_OUT_DIR}"
 mkdir -p "${ROOT_OUT_DIR}/logs"
@@ -47,6 +49,14 @@ fi
 
 echo "Launching ${#EXPERIMENT_NAMES[@]} async jobs"
 
+QUALITY_ARGS=""
+if [[ "${QUALITY_AWARE_FUSION}" == "1" ]]; then
+  QUALITY_ARGS="--quality-aware-fusion --quality-hidden-dim 128 --quality-min-gate 0.10 --lambda-quality 0.10"
+fi
+if (( $(echo "${MODALITY_DROP_PROB} > 0" | bc -l) )); then
+  QUALITY_ARGS="${QUALITY_ARGS} --quality-drop-prob ${MODALITY_DROP_PROB}"
+fi
+
 for i in "${!EXPERIMENT_NAMES[@]}"; do
   name="${EXPERIMENT_NAMES[$i]}"
   flags="${EXPERIMENT_FLAGS[$i]}"
@@ -65,22 +75,22 @@ for i in "${!EXPERIMENT_NAMES[@]}"; do
     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
       --stage 1 --dataset '${DATASET}' --output-dir '${out_root}/stage1_encoder_cls' --device cuda \
       --epochs 24 --batch-size '${BATCH_SIZE}' --lr 1e-3 --weight-decay 1e-4 --label-smoothing 0.05 \
-      --model-dim 128 --token-dim 256 --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags} && \
+      --model-dim 128 --token-dim 256 --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_ARGS} ${flags} && \
     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
       --stage 2 --dataset '${DATASET}' --output-dir '${out_root}/stage2_signal_fusion' --init '${out_root}/stage1_encoder_cls/best.pt' --device cuda \
       --epochs 20 --batch-size '${BATCH_SIZE}' --lr 3e-4 --weight-decay 1e-4 --label-smoothing 0.05 \
       --model-dim 128 --token-dim 256 --fusion-layers 2 --fusion-heads 8 --fusion-ff 768 --pool attn \
-      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags} && \
+      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_ARGS} ${flags} && \
     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
       --stage 3 --dataset '${DATASET}' --corpus '${CORPUS}' --output-dir '${out_root}/stage3_signal_text_align' --init '${out_root}/stage2_signal_fusion/best.pt' --device cuda \
       --epochs 16 --batch-size '${BATCH_SIZE}' --lr 2e-4 --weight-decay 1e-4 --label-smoothing 0.03 --lambda-align 0.15 \
       --model-dim 128 --token-dim 256 --text-backbone '${TEXT_BACKBONE}' --qwen-path '${QWEN_PATH}' --text-batch-size 8 \
-      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags} && \
+      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_ARGS} ${flags} && \
     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
       --stage 4 --dataset '${DATASET}' --corpus '${CORPUS}' --output-dir '${out_root}/stage4_signal_text_llm' --init '${out_root}/stage3_signal_text_align/best.pt' --device cuda \
       --epochs 16 --batch-size '${BATCH_SIZE}' --lr 2e-4 --weight-decay 1e-4 --label-smoothing 0.03 --lambda-align 0.08 \
       --model-dim 128 --token-dim 256 --text-backbone '${TEXT_BACKBONE}' --qwen-path '${QWEN_PATH}' --text-batch-size 8 \
-      --llm-layers 4 --llm-heads 8 --llm-ff 768 --pool attn --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags}
+      --llm-layers 4 --llm-heads 8 --llm-ff 768 --pool attn --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_ARGS} ${flags}
   " > "${log_file}" 2>&1 < /dev/null &
 
   echo $! > "${pid_file}"

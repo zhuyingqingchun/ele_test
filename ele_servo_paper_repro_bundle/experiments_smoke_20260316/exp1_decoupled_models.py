@@ -25,6 +25,8 @@ class StageOutputs:
     logits: Tensor
     align_loss: Tensor | None
     quality_loss: Tensor | None = None
+    quality_gates: Tensor | None = None
+    branch_energies: Tensor | None = None
 
 
 class SequencePooling(nn.Module):
@@ -86,7 +88,7 @@ class DecoupledSignalTokenBackbone(nn.Module):
         self.pos_encoder = TemporalExplainableEncoder(input_dims["pos"], model_dim, token_count=20, hidden_dim=48, dilations=(1, 2, 4, 8))
         self.electrical_encoder = TemporalExplainableEncoder(input_dims["electrical"], model_dim, token_count=24, hidden_dim=56, dilations=(1, 2, 4, 8))
         self.thermal_encoder = ThermalStateEncoder(input_dims["thermal"], model_dim, token_count=8, hidden_dim=32)
-        self.vibration_encoder = VibrationStateEncoder(input_dims["vibration"], model_dim, token_count=12, hidden_dim=32)
+        self.vibration_encoder = VibrationStateEncoder(input_dims["vibration"], model_dim, token_count=16, hidden_dim=64)
         self.proj = nn.Sequential(
             nn.LayerNorm(model_dim),
             nn.Linear(model_dim, token_dim),
@@ -119,7 +121,7 @@ class DecoupledSignalTokenBackbone(nn.Module):
         tokens, _, _ = encoder(x)
         return self.proj(tokens)
 
-    def forward(self, batch) -> tuple[Tensor, Tensor, Tensor | None]:
+    def forward(self, batch) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor]:
         pos_in, pos_target = self._corrupt_modality(batch.pos)
         electrical_in, electrical_target = self._corrupt_modality(batch.electrical)
         thermal_in, thermal_target = self._corrupt_modality(batch.thermal)
@@ -131,6 +133,7 @@ class DecoupledSignalTokenBackbone(nn.Module):
         vibration_tokens = self._encode_project(self.vibration_encoder, vibration_in)
 
         quality_loss = None
+        gates = None
         if self.quality_estimator is not None:
             pooled_stack = torch.stack(
                 [
@@ -157,12 +160,22 @@ class DecoupledSignalTokenBackbone(nn.Module):
             thermal_tokens = thermal_tokens * gates[:, 2].view(-1, 1, 1)
             vibration_tokens = vibration_tokens * gates[:, 3].view(-1, 1, 1)
 
+        branch_energies = torch.stack(
+            [
+                pos_tokens.pow(2).mean(dim=(1, 2)),
+                electrical_tokens.pow(2).mean(dim=(1, 2)),
+                thermal_tokens.pow(2).mean(dim=(1, 2)),
+                vibration_tokens.pow(2).mean(dim=(1, 2)),
+            ],
+            dim=1,
+        )
+
         tokens = torch.cat(
             [pos_tokens, electrical_tokens, thermal_tokens, vibration_tokens],
             dim=1,
         )
         pooled = F.normalize(tokens.mean(dim=1), dim=-1)
-        return tokens, pooled, quality_loss
+        return tokens, pooled, quality_loss, gates, branch_energies
 
 
 class Stage1DecoupledClassifier(nn.Module):
@@ -197,8 +210,14 @@ class Stage1DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch) -> StageOutputs:
-        _tokens, pooled, quality_loss = self.backbone(batch)
-        return StageOutputs(logits=self.head(pooled), align_loss=None, quality_loss=quality_loss)
+        _tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+        return StageOutputs(
+            logits=self.head(pooled),
+            align_loss=None,
+            quality_loss=quality_loss,
+            quality_gates=quality_gates,
+            branch_energies=branch_energies,
+        )
 
 
 class Stage2DecoupledClassifier(nn.Module):
@@ -250,12 +269,18 @@ class Stage2DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch) -> StageOutputs:
-        tokens, _pooled, quality_loss = self.backbone(batch)
+        tokens, _pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
         cls = self.cls.expand(tokens.shape[0], -1, -1)
         seq = torch.cat([cls, tokens], dim=1)
         seq = self.encoder(seq)
         seq = self.norm(seq)
-        return StageOutputs(logits=self.head(self.pool(seq)), align_loss=None, quality_loss=quality_loss)
+        return StageOutputs(
+            logits=self.head(self.pool(seq)),
+            align_loss=None,
+            quality_loss=quality_loss,
+            quality_gates=quality_gates,
+            branch_energies=branch_energies,
+        )
 
 
 class Stage3DecoupledClassifier(nn.Module):
@@ -299,13 +324,15 @@ class Stage3DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch, text_embeddings: Tensor) -> StageOutputs:
-        _tokens, pooled, quality_loss = self.backbone(batch)
+        _tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
         logits = self.head(pooled)
         text_vec = F.normalize(self.text_proj(text_embeddings), dim=-1)
         return StageOutputs(
             logits=logits,
             align_loss=info_nce(pooled, text_vec, temperature=self.temperature),
             quality_loss=quality_loss,
+            quality_gates=quality_gates,
+            branch_energies=branch_energies,
         )
 
 
@@ -367,7 +394,7 @@ class Stage4DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch, text_embeddings: Tensor) -> StageOutputs:
-        signal_tokens, pooled, quality_loss = self.backbone(batch)
+        signal_tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
         text_token = F.normalize(self.text_proj(text_embeddings), dim=-1).unsqueeze(1)
         cls = self.cls.expand(signal_tokens.shape[0], -1, -1)
         seq = torch.cat([cls, signal_tokens, text_token], dim=1)
@@ -376,4 +403,10 @@ class Stage4DecoupledClassifier(nn.Module):
         pooled_seq = self.pool(seq, text_index=seq.shape[1] - 1)
         logits = self.head(pooled_seq)
         align_loss = info_nce(pooled, text_token.squeeze(1), temperature=self.temperature)
-        return StageOutputs(logits=logits, align_loss=align_loss, quality_loss=quality_loss)
+        return StageOutputs(
+            logits=logits,
+            align_loss=align_loss,
+            quality_loss=quality_loss,
+            quality_gates=quality_gates,
+            branch_energies=branch_energies,
+        )

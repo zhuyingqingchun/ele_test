@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from servo_diagnostic.multimodal_method import load_multimodal_arrays
+from servo_diagnostic.multimodal_method import FAMILY_BY_SCENARIO, load_multimodal_arrays
 from servo_llm_alignment.dataset import load_alignment_records
 from servo_llm_alignment.text_encoder import MockFrozenTextEncoder, QwenFrozenTextEncoder
 
@@ -54,6 +54,7 @@ class DecoupledBatch:
     electrical: torch.Tensor
     thermal: torch.Tensor
     vibration: torch.Tensor
+    sample_index: torch.Tensor
     y_cls: torch.Tensor
 
 
@@ -91,6 +92,7 @@ class DecoupledDataset(Dataset):
             electrical=torch.from_numpy(self.arrays["X_electrical"][item]).float(),
             thermal=torch.from_numpy(self.arrays["X_thermal"][item]).float(),
             vibration=torch.from_numpy(self.arrays["X_vibration"][item]).float(),
+            sample_index=torch.tensor(item, dtype=torch.long),
             y_cls=torch.tensor(self.arrays["y_cls"][item], dtype=torch.long),
         )
 
@@ -115,6 +117,7 @@ def collate_decoupled_batch(items: list[DecoupledBatch]) -> DecoupledBatch:
         electrical=torch.stack([x.electrical for x in items], dim=0),
         thermal=torch.stack([x.thermal for x in items], dim=0),
         vibration=torch.stack([x.vibration for x in items], dim=0),
+        sample_index=torch.stack([x.sample_index for x in items], dim=0),
         y_cls=torch.stack([x.y_cls for x in items], dim=0),
     )
 
@@ -131,6 +134,7 @@ def move_batch_to_device(batch: DecoupledBatch, device: torch.device) -> Decoupl
         electrical=batch.electrical.to(device),
         thermal=batch.thermal.to(device),
         vibration=batch.vibration.to(device),
+        sample_index=batch.sample_index.to(device),
         y_cls=batch.y_cls.to(device),
     )
 
@@ -438,6 +442,9 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
     quality_sum = 0.0
     all_preds = []
     all_targets = []
+    all_sample_indices = []
+    all_quality_gates = []
+    all_branch_energies = []
     with torch.no_grad():
         for batch in loader:
             if isinstance(batch, tuple):
@@ -464,6 +471,11 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
             if return_predictions:
                 all_preds.extend(preds.cpu().numpy().tolist())
                 all_targets.extend(batch.y_cls.cpu().numpy().tolist())
+                all_sample_indices.extend(batch.sample_index.cpu().numpy().tolist())
+                if getattr(outputs, "quality_gates", None) is not None:
+                    all_quality_gates.extend(outputs.quality_gates.cpu().numpy().tolist())
+                if getattr(outputs, "branch_energies", None) is not None:
+                    all_branch_energies.extend(outputs.branch_energies.cpu().numpy().tolist())
     result = {
         "loss": loss_sum / max(1, total),
         "scenario_accuracy": correct / max(1, total),
@@ -473,7 +485,18 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
     if return_predictions:
         result["predictions"] = all_preds
         result["targets"] = all_targets
+        result["sample_indices"] = all_sample_indices
+        result["quality_gates"] = all_quality_gates
+        result["branch_energies"] = all_branch_energies
     return result
+
+
+BRANCH_NAMES = ["position", "electrical", "thermal", "vibration"]
+MECHANICAL_RELATED_FAMILIES = {"mechanical_fault", "friction_increase", "jam", "load_disturbance"}
+
+
+def _mean_or_nan(values: list[float]) -> float:
+    return float(sum(values) / len(values)) if values else float("nan")
 
 
 def load_init(model, init_path: Path) -> None:
@@ -743,6 +766,116 @@ def main() -> None:
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"report={report_path}")
+
+    # Export quality gates and branch energies for test set
+    if test_results.get("quality_gates") and test_results.get("branch_energies"):
+        _export_quality_gate_analysis(
+            args.output_dir,
+            test_results,
+            arrays["class_names"],
+        )
+
+
+def _export_quality_gate_analysis(
+    output_dir: Path,
+    test_results: dict,
+    class_names: np.ndarray,
+) -> None:
+    """Export quality gate analysis to CSV and JSON."""
+    import csv
+
+    sample_indices = test_results.get("sample_indices", [])
+    predictions = test_results.get("predictions", [])
+    targets = test_results.get("targets", [])
+    quality_gates = test_results.get("quality_gates", [])
+    branch_energies = test_results.get("branch_energies", [])
+
+    if not quality_gates or not branch_energies:
+        return
+
+    # Export per-sample CSV
+    csv_path = output_dir / "test_quality_gates.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = ["sample_index", "true_class", "pred_class", "true_class_name", "pred_class_name"]
+        header += [f"gate_{name}" for name in BRANCH_NAMES]
+        header += [f"energy_{name}" for name in BRANCH_NAMES]
+        writer.writerow(header)
+
+        for i, (idx, pred, target) in enumerate(zip(sample_indices, predictions, targets)):
+            row = [
+                idx,
+                target,
+                pred,
+                str(class_names[target]),
+                str(class_names[pred]),
+            ]
+            if i < len(quality_gates):
+                row += [f"{g:.6f}" for g in quality_gates[i]]
+            else:
+                row += [""] * len(BRANCH_NAMES)
+            if i < len(branch_energies):
+                row += [f"{e:.6f}" for e in branch_energies[i]]
+            else:
+                row += [""] * len(BRANCH_NAMES)
+            writer.writerow(row)
+
+    # Compute class-level and mechanical-related statistics
+    class_gate_sums: dict[int, list[float]] = {}
+    class_gate_counts: dict[int, int] = {}
+    class_energy_sums: dict[int, list[float]] = {}
+    mech_gate_values: list[list[float]] = []
+    non_mech_gate_values: list[list[float]] = []
+
+    for i, target in enumerate(targets):
+        if i >= len(quality_gates):
+            continue
+        gates = quality_gates[i]
+        energies = branch_energies[i] if i < len(branch_energies) else [0.0] * len(BRANCH_NAMES)
+
+        if target not in class_gate_sums:
+            class_gate_sums[target] = [0.0] * len(BRANCH_NAMES)
+            class_energy_sums[target] = [0.0] * len(BRANCH_NAMES)
+        class_gate_counts[target] = class_gate_counts.get(target, 0) + 1
+        for j, g in enumerate(gates):
+            class_gate_sums[target][j] += g
+        for j, e in enumerate(energies):
+            class_energy_sums[target][j] += e
+
+        class_name = str(class_names[target]).lower()
+        family = FAMILY_BY_SCENARIO.get(class_name, "")
+        if family in MECHANICAL_RELATED_FAMILIES:
+            mech_gate_values.append(gates)
+        else:
+            non_mech_gate_values.append(gates)
+
+    # Build summary JSON
+    summary = {
+        "branch_names": BRANCH_NAMES,
+        "per_class": {},
+        "mechanical_related": {
+            "families": list(MECHANICAL_RELATED_FAMILIES),
+            "sample_count": len(mech_gate_values),
+            "mean_gate": [_mean_or_nan([g[i] for g in mech_gate_values]) for i in range(len(BRANCH_NAMES))],
+        },
+        "non_mechanical": {
+            "sample_count": len(non_mech_gate_values),
+            "mean_gate": [_mean_or_nan([g[i] for g in non_mech_gate_values]) for i in range(len(BRANCH_NAMES))],
+        },
+    }
+
+    for class_idx in sorted(class_gate_sums.keys()):
+        count = class_gate_counts[class_idx]
+        summary["per_class"][str(class_names[class_idx])] = {
+            "class_index": class_idx,
+            "sample_count": count,
+            "mean_gate": [class_gate_sums[class_idx][i] / count for i in range(len(BRANCH_NAMES))],
+            "mean_energy": [class_energy_sums[class_idx][i] / count for i in range(len(BRANCH_NAMES))],
+        }
+
+    summary_path = output_dir / "test_quality_gate_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"quality_gate_summary={summary_path}")
 
 
 if __name__ == "__main__":

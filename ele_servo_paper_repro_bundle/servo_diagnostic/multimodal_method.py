@@ -510,28 +510,83 @@ class VibrationStateEncoder(nn.Module):
     def __init__(self, input_dim: int, model_dim: int, token_count: int, hidden_dim: int) -> None:
         super().__init__()
         self.channel_gate = ChannelGate(input_dim, hidden_dim)
-        self.time_branch = nn.Sequential(
-            nn.Conv1d(input_dim, model_dim, kernel_size=7, padding=3),
+        self.token_count = int(token_count)
+        self.stft_n_fft = 64
+        self.stft_hop = 16
+        self.raw_local_branch = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=7, padding=3),
             nn.GELU(),
-            nn.Conv1d(model_dim, model_dim, kernel_size=5, padding=2),
+            nn.Conv1d(hidden_dim, model_dim, kernel_size=5, padding=2),
             nn.GELU(),
         )
-        self.freq_proj = nn.Linear(input_dim, model_dim)
-        self.token_count = token_count
+        self.raw_context_branch = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=15, padding=7),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, model_dim, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+        self.envelope_smoother = nn.AvgPool1d(kernel_size=9, stride=1, padding=4)
+        self.envelope_branch = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, model_dim, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+        self.tf_proj = nn.LazyLinear(model_dim)
+        self.tf_norm = nn.LayerNorm(model_dim)
+        gate_hidden = max(hidden_dim, 16)
+        self.branch_gate = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, gate_hidden),
+            nn.GELU(),
+            nn.Linear(gate_hidden, 1),
+        )
         self.token_norm = nn.LayerNorm(model_dim)
         self.pool = AttentionPooling(model_dim)
+        self.last_branch_weights: Tensor | None = None
+
+    def _build_tf_tokens(self, x: Tensor) -> Tensor:
+        batch_size, time_steps, channels = x.shape
+        n_fft = min(self.stft_n_fft, max(16, time_steps))
+        hop = max(4, min(self.stft_hop, max(1, n_fft // 4)))
+        window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+        flat = x.transpose(1, 2).reshape(batch_size * channels, time_steps)
+        spectrum = torch.stft(
+            flat,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
+            center=False,
+            return_complex=True,
+        )
+        magnitude = torch.log1p(spectrum.abs())
+        magnitude = magnitude.reshape(batch_size, channels, magnitude.shape[-2], magnitude.shape[-1]).mean(dim=1)
+        tf_tokens = self.tf_proj(magnitude.transpose(1, 2))
+        tf_tokens = F.adaptive_avg_pool1d(tf_tokens.transpose(1, 2), self.token_count).transpose(1, 2)
+        return self.tf_norm(tf_tokens)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x, channel_weights = self.channel_gate(x)
-        time_tokens = self.time_branch(x.transpose(1, 2)).transpose(1, 2)
-        time_tokens = F.adaptive_avg_pool1d(time_tokens.transpose(1, 2), self.token_count).transpose(1, 2)
+        vib_input = x.transpose(1, 2)
 
-        freq = torch.fft.rfft(x, dim=1)
-        freq_mag = torch.log1p(freq.abs())
-        freq_tokens = self.freq_proj(freq_mag)
-        freq_tokens = F.adaptive_avg_pool1d(freq_tokens.transpose(1, 2), self.token_count).transpose(1, 2)
+        raw_tokens = self.raw_local_branch(vib_input) + self.raw_context_branch(vib_input)
+        raw_tokens = F.adaptive_avg_pool1d(raw_tokens, self.token_count).transpose(1, 2)
 
-        tokens = self.token_norm(time_tokens + freq_tokens)
+        envelope = self.envelope_smoother(vib_input.abs())
+        envelope_tokens = self.envelope_branch(envelope)
+        envelope_tokens = F.adaptive_avg_pool1d(envelope_tokens, self.token_count).transpose(1, 2)
+
+        tf_tokens = self._build_tf_tokens(x)
+
+        branch_tokens = torch.stack([raw_tokens, envelope_tokens, tf_tokens], dim=1)
+        branch_summary = branch_tokens.mean(dim=2)
+        branch_logits = self.branch_gate(branch_summary).squeeze(-1)
+        branch_weights = torch.softmax(branch_logits, dim=1)
+        self.last_branch_weights = branch_weights.detach()
+
+        tokens = (branch_tokens * branch_weights[:, :, None, None]).sum(dim=1)
+        tokens = self.token_norm(tokens)
         pooled, _ = self.pool(tokens)
         return tokens, pooled, channel_weights
 
