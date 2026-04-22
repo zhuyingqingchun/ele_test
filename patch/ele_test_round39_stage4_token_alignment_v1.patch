@@ -1,0 +1,696 @@
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/token_evidence_alignment_v1_utils.py
+@@ -0,0 +1,119 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from torch import Tensor
++
++from experiments_smoke_20260316.modality_evidence_topk_v5 import (
++    BRANCH_NAMES,
++    PRIMARY_MODALITY_BY_SCENARIO,
++    SUPPORT_MODALITIES_BY_SCENARIO,
++    canonical_scenario_name,
++)
++
++TOKEN_GROUP_LENGTHS = [20, 24, 8, 16]
++
++
++def build_token_group_slices(lengths: list[int] | None = None) -> list[slice]:
++    lengths = lengths or TOKEN_GROUP_LENGTHS
++    slices: list[slice] = []
++    start = 0
++    for ln in lengths:
++        slices.append(slice(start, start + int(ln)))
++        start += int(ln)
++    return slices
++
++
++def expand_modality_mask_to_tokens(mask: Tensor, lengths: list[int] | None = None) -> Tensor:
++    lengths = lengths or TOKEN_GROUP_LENGTHS
++    chunks = [mask[:, i:i + 1].expand(-1, int(lengths[i])) for i in range(mask.shape[1])]
++    return torch.cat(chunks, dim=1)
++
++
++def token_transport_plan(signal_tokens: Tensor, evidence_emb: Tensor, mechanism_emb: Tensor, temperature: float = 0.07) -> Tensor:
++    views = torch.stack([evidence_emb, mechanism_emb], dim=1)  # [B, 2, D]
++    signal_tokens = F.normalize(signal_tokens, dim=-1)
++    views = F.normalize(views, dim=-1)
++    logits = torch.einsum("btd,bvd->btv", signal_tokens, views) / max(float(temperature), 1.0e-6)
++    return torch.softmax(logits, dim=1)
++
++
++def aggregate_token_mass_by_modality(token_plan: Tensor, lengths: list[int] | None = None) -> Tensor:
++    lengths = lengths or TOKEN_GROUP_LENGTHS
++    masses = []
++    start = 0
++    for ln in lengths:
++        masses.append(token_plan[:, start:start + int(ln), :].sum(dim=1))
++        start += int(ln)
++    return torch.stack(masses, dim=1)  # [B, M, 2]
++
++
++def token_primary_support_loss(
++    token_plan: Tensor,
++    primary_mask: Tensor,
++    support_mask: Tensor,
++    *,
++    lambda_support: float = 0.5,
++    lambda_sparse: float = 0.05,
++) -> tuple[Tensor, Tensor]:
++    token_primary = expand_modality_mask_to_tokens(primary_mask)
++    token_support = expand_modality_mask_to_tokens(support_mask)
++    token_other = 1.0 - torch.clamp(token_primary + token_support, max=1.0)
++
++    # evidence view: primary should dominate
++    evidence_primary_mass = (token_plan[:, :, 0] * token_primary).sum(dim=1)
++    evidence_other_mass = (token_plan[:, :, 0] * token_other).sum(dim=1)
++
++    # mechanism view: primary + support should dominate
++    mechanism_primary_support_mass = (token_plan[:, :, 1] * torch.clamp(token_primary + token_support, max=1.0)).sum(dim=1)
++    mechanism_other_mass = (token_plan[:, :, 1] * token_other).sum(dim=1)
++
++    main_loss = (
++        -torch.log(evidence_primary_mass.clamp_min(1.0e-6))
++        -lambda_support * torch.log(mechanism_primary_support_mass.clamp_min(1.0e-6))
++        + 0.2 * F.relu(0.10 - (evidence_primary_mass - evidence_other_mass))
++        + 0.2 * F.relu(0.10 - (mechanism_primary_support_mass - mechanism_other_mass))
++    ).mean()
++
++    entropy = -(token_plan.clamp_min(1.0e-8) * torch.log(token_plan.clamp_min(1.0e-8))).sum(dim=1).mean()
++    total = main_loss + lambda_sparse * entropy
++    return total, entropy
++
++
++def summarize_token_alignment_rows(rows: list[dict]) -> dict:
++    fault_rows = [r for r in rows if canonical_scenario_name(r["scenario"]) != "normal"]
++    if not fault_rows:
++        return {}
++
++    def mean_bool(key: str) -> float:
++        return sum(1.0 if r.get(key) else 0.0 for r in fault_rows) / len(fault_rows)
++
++    def mean_float(key: str) -> float:
++        return sum(float(r.get(key, 0.0)) for r in fault_rows) / len(fault_rows)
++
++    return {
++        "fault_only_count": len(fault_rows),
++        "evidence_primary_in_top2": mean_bool("evidence_primary_in_top2"),
++        "evidence_primary_in_top3": mean_bool("evidence_primary_in_top3"),
++        "evidence_primary_or_support_at3": mean_bool("evidence_primary_or_support_at3"),
++        "evidence_weighted_consistency_at3": mean_float("evidence_weighted_consistency_at3"),
++        "mechanism_primary_in_top2": mean_bool("mechanism_primary_in_top2"),
++        "mechanism_primary_in_top3": mean_bool("mechanism_primary_in_top3"),
++        "mechanism_primary_or_support_at3": mean_bool("mechanism_primary_or_support_at3"),
++        "mechanism_weighted_consistency_at3": mean_float("mechanism_weighted_consistency_at3"),
++        "mean_evidence_mass_position": mean_float("evidence_mass_position"),
++        "mean_evidence_mass_electrical": mean_float("evidence_mass_electrical"),
++        "mean_evidence_mass_thermal": mean_float("evidence_mass_thermal"),
++        "mean_evidence_mass_vibration": mean_float("evidence_mass_vibration"),
++        "mean_mechanism_mass_position": mean_float("mechanism_mass_position"),
++        "mean_mechanism_mass_electrical": mean_float("mechanism_mass_electrical"),
++        "mean_mechanism_mass_thermal": mean_float("mechanism_mass_thermal"),
++        "mean_mechanism_mass_vibration": mean_float("mechanism_mass_vibration"),
++    }
++
++
++def save_json(path: Path, payload: dict) -> None:
++    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/exp1_stage4_token_evidence_alignment_v1_models.py
+@@ -0,0 +1,141 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++import torch.nn.functional as F
++from torch import Tensor, nn
++
++from experiments_smoke_20260316.exp1_decoupled_models import DecoupledSignalTokenBackbone, SequencePooling
++from experiments_smoke_20260316.exp1_topk_duallevel_align_v2_models import TextGuidedFaultGate
++from experiments_smoke_20260316.token_evidence_alignment_v1_utils import TOKEN_GROUP_LENGTHS, token_transport_plan
++
++
++@dataclass
++class Stage4TokenEvidenceOutputs:
++    logits: Tensor
++    signal_embedding: Tensor
++    signal_tokens: Tensor
++    modality_scores: Tensor
++    modality_embeddings: Tensor
++    combined_text_embedding: Tensor
++    evidence_text_embedding: Tensor
++    mechanism_text_embedding: Tensor
++    contrast_text_embedding: Tensor
++    token_plan: Tensor
++    quality_loss: Tensor | None = None
++    quality_gates: Tensor | None = None
++    branch_energies: Tensor | None = None
++
++
++class Stage4TokenEvidenceAlignmentV1(nn.Module):
++    lengths = TOKEN_GROUP_LENGTHS
++
++    def __init__(
++        self,
++        input_dims: dict[str, int],
++        num_classes: int,
++        text_dim: int,
++        *,
++        model_dim: int = 128,
++        token_dim: int = 256,
++        num_layers: int = 4,
++        nhead: int = 8,
++        dim_feedforward: int = 768,
++        pool: str = "attn",
++        quality_aware_fusion: bool = True,
++        quality_hidden_dim: int = 128,
++        modality_drop_prob: float = 0.10,
++        quality_min_gate: float = 0.10,
++        fault_gate_hidden_dim: int = 128,
++    ) -> None:
++        super().__init__()
++        self.backbone = DecoupledSignalTokenBackbone(
++            input_dims,
++            model_dim=model_dim,
++            token_dim=token_dim,
++            quality_aware_fusion=quality_aware_fusion,
++            quality_hidden_dim=quality_hidden_dim,
++            modality_drop_prob=modality_drop_prob,
++            quality_min_gate=quality_min_gate,
++        )
++        self.text_proj = nn.Sequential(
++            nn.LayerNorm(text_dim),
++            nn.Linear(text_dim, token_dim),
++            nn.GELU(),
++            nn.Dropout(0.10),
++        )
++        self.fault_gate = TextGuidedFaultGate(token_dim, hidden_dim=fault_gate_hidden_dim)
++        layer = nn.TransformerEncoderLayer(
++            d_model=token_dim,
++            nhead=nhead,
++            dim_feedforward=dim_feedforward,
++            dropout=0.10,
++            activation="gelu",
++            batch_first=True,
++            norm_first=True,
++        )
++        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
++        self.cls = nn.Parameter(torch.zeros(1, 1, token_dim))
++        self.norm = nn.LayerNorm(token_dim)
++        self.pool = SequencePooling(token_dim, pool)
++        self.head = nn.Sequential(
++            nn.LayerNorm(token_dim),
++            nn.Linear(token_dim, token_dim),
++            nn.GELU(),
++            nn.Dropout(0.15),
++            nn.Linear(token_dim, num_classes),
++        )
++
++    def _split_modality_embeddings(self, tokens: Tensor) -> Tensor:
++        outs = []
++        start = 0
++        for ln in self.lengths:
++            outs.append(tokens[:, start:start + ln, :].mean(dim=1))
++            start += ln
++        return torch.stack(outs, dim=1)
++
++    def forward(self, batch, text_views: dict[str, Tensor]) -> Stage4TokenEvidenceOutputs:
++        backbone_out = self.backbone(batch)
++        if isinstance(backbone_out, tuple) and len(backbone_out) == 6:
++            signal_tokens, pooled, quality_loss, quality_gates, branch_energies, _ = backbone_out
++        else:
++            signal_tokens, pooled, quality_loss, quality_gates, branch_energies = backbone_out
++        modality_embeddings = self._split_modality_embeddings(signal_tokens)
++
++        combined = F.normalize(self.text_proj(text_views["combined"]), dim=-1)
++        evidence = F.normalize(self.text_proj(text_views["evidence"]), dim=-1)
++        mechanism = F.normalize(self.text_proj(text_views["mechanism"]), dim=-1)
++        contrast = F.normalize(self.text_proj(text_views["contrast"]), dim=-1)
++
++        fault_gates = self.fault_gate(modality_embeddings, pooled, evidence, mechanism)
++
++        repeats = torch.tensor(self.lengths, device=signal_tokens.device)
++        gated_tokens = signal_tokens * torch.repeat_interleave(fault_gates, repeats, dim=1).unsqueeze(-1)
++
++        token_plan = token_transport_plan(gated_tokens, evidence, mechanism, temperature=0.07)
++
++        cls = self.cls.expand(gated_tokens.shape[0], -1, -1)
++        seq = torch.cat(
++            [cls, gated_tokens, evidence.unsqueeze(1), mechanism.unsqueeze(1), combined.unsqueeze(1)],
++            dim=1,
++        )
++        seq = self.norm(self.encoder(seq))
++        pooled_seq = self.pool(seq)
++        logits = self.head(pooled_seq)
++
++        return Stage4TokenEvidenceOutputs(
++            logits=logits,
++            signal_embedding=F.normalize(pooled_seq, dim=-1),
++            signal_tokens=gated_tokens,
++            modality_scores=fault_gates,
++            modality_embeddings=modality_embeddings,
++            combined_text_embedding=combined,
++            evidence_text_embedding=evidence,
++            mechanism_text_embedding=mechanism,
++            contrast_text_embedding=contrast,
++            token_plan=token_plan,
++            quality_loss=quality_loss,
++            quality_gates=quality_gates,
++            branch_energies=branch_energies,
++        )
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_stage4_token_evidence_alignment_v1.py
+@@ -0,0 +1,406 @@
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import math
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from torch.utils.data import DataLoader, Dataset
++
++PROJECT_ROOT = Path(__file__).resolve().parent.parent
++if str(PROJECT_ROOT) not in sys.path:
++    sys.path.insert(0, str(PROJECT_ROOT))
++
++from servo_llm_alignment.text_encoder import MockFrozenTextEncoder, QwenFrozenTextEncoder
++from experiments_smoke_20260316.train_exp1_decoupled_stages import (
++    DecoupledDataset,
++    STRICT_DECOUPLED_COLUMNS,
++    apply_feature_mode,
++    apply_normalization,
++    batch_input_dims,
++    collate_decoupled_batch,
++    compute_normalization_stats,
++    load_decoupled_arrays,
++    move_batch_to_device,
++    stratified_split_three_way,
++)
++from experiments_smoke_20260316.exp1_stage4_token_evidence_alignment_v1_models import Stage4TokenEvidenceAlignmentV1
++from experiments_smoke_20260316.modality_evidence_topk_v5 import (
++    PRIMARY_MODALITY_BY_SCENARIO,
++    SUPPORT_MODALITIES_BY_SCENARIO,
++    SoftPrototypeBank,
++    batch_primary_support_masks,
++    canonical_scenario_name,
++    contrast_separation_loss,
++    hard_negative_text_loss,
++    listwise_topk_loss,
++    save_summary_json,
++    summarize_topk_rows,
++    topk_modalities,
++    weighted_consistency_at3,
++)
++from experiments_smoke_20260316.exp1_topk_duallevel_align_v2_models import info_nce
++from experiments_smoke_20260316.token_evidence_alignment_v1_utils import (
++    aggregate_token_mass_by_modality,
++    save_json,
++    summarize_token_alignment_rows,
++    token_primary_support_loss,
++)
++
++BRANCH_NAMES = ["position", "electrical", "thermal", "vibration"]
++
++
++class StageTextDataset(Dataset):
++    def __init__(self, base: DecoupledDataset, records: list, indices: np.ndarray) -> None:
++        self.base = base
++        self.records = records
++        self.indices = indices.astype(np.int64)
++
++    def __len__(self) -> int:
++        return int(self.indices.shape[0])
++
++    def __getitem__(self, idx: int):
++        item = int(self.indices[idx])
++        return self.base[item], self.records[item]
++
++
++def collate_with_records(items):
++    batches = [item[0] for item in items]
++    recs = [item[1] for item in items]
++    return collate_decoupled_batch(batches), recs
++
++
++def _extract_view_text(record, view_name: str) -> str:
++    texts = getattr(record, "texts", {}) or {}
++    if view_name == "combined":
++        return str(texts.get("combined_text", "") or getattr(record, "text", ""))
++    if view_name == "evidence":
++        return str(texts.get("evidence_text", "") or texts.get("combined_text", ""))
++    if view_name == "mechanism":
++        return str(texts.get("mechanism_text", "") or texts.get("combined_text", ""))
++    if view_name == "contrast":
++        return str(texts.get("contrast_text", "") or texts.get("combined_text", ""))
++    raise KeyError(view_name)
++
++
++def build_multiview_text_cache(output_dir: Path, records: list, text_backbone: str, qwen_path: Path, device: torch.device, text_batch_size: int):
++    if text_backbone == "qwen":
++        text_encoder = QwenFrozenTextEncoder(str(qwen_path), device=device)
++        text_dim = int(text_encoder.hidden_size)
++    else:
++        text_encoder = MockFrozenTextEncoder(hidden_size=768)
++        text_dim = int(text_encoder.hidden_size)
++    output_dir.mkdir(parents=True, exist_ok=True)
++    cache_path = output_dir / f"text_token_alignment_multiview__{text_backbone}.pt"
++    if cache_path.exists():
++        return torch.load(cache_path, map_location="cpu", weights_only=False), text_dim
++    cache = {}
++    for view_name in ["combined", "evidence", "mechanism", "contrast"]:
++        texts = [_extract_view_text(record, view_name) for record in records]
++        cache[view_name] = text_encoder.encode_texts(texts, batch_size=text_batch_size)
++    torch.save(cache, cache_path)
++    return cache, text_dim
++
++
++def build_text_views_from_records(text_cache: dict[str, torch.Tensor], recs: list, device: torch.device) -> dict[str, torch.Tensor]:
++    idx = torch.as_tensor([int(r.index) for r in recs], dtype=torch.long)
++    return {key: value[idx].to(device) for key, value in text_cache.items()}
++
++
++def load_init(model, init_path: Path) -> None:
++    payload = torch.load(init_path, map_location="cpu", weights_only=False)
++    state = payload.get("model") or payload.get("model_state") or payload.get("state_dict") or payload
++    model.load_state_dict(state, strict=False)
++
++
++def write_rows_csv(path: Path, rows: list[dict]) -> None:
++    if not rows:
++        return
++    with path.open("w", encoding="utf-8", newline="") as f:
++        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
++        writer.writeheader()
++        writer.writerows(rows)
++
++
++def compute_total_loss(outputs, labels: torch.Tensor, recs: list, class_names: list[str], prototype_bank: SoftPrototypeBank | None, lambda_cfg: dict[str, float]):
++    cls_loss = F.cross_entropy(outputs.logits, labels)
++    align_combined = info_nce(outputs.signal_embedding, outputs.combined_text_embedding, temperature=0.07)
++    align_evidence = info_nce(outputs.signal_embedding, outputs.evidence_text_embedding, temperature=0.07)
++    align_mechanism = info_nce(outputs.signal_embedding, outputs.mechanism_text_embedding, temperature=0.07)
++    contrast_loss = contrast_separation_loss(outputs.signal_embedding, outputs.evidence_text_embedding, outputs.contrast_text_embedding)
++
++    scenarios = [canonical_scenario_name(getattr(r, "scenario", "")) for r in recs]
++    primary_mask, support_mask = batch_primary_support_masks(scenarios, outputs.logits.device)
++
++    listwise = listwise_topk_loss(outputs.modality_scores, primary_mask, support_mask)
++    token_loss, token_entropy = token_primary_support_loss(outputs.token_plan, primary_mask, support_mask, lambda_support=0.5, lambda_sparse=float(lambda_cfg["token_sparse"]))
++    hard_neg = hard_negative_text_loss(outputs.signal_embedding, outputs.evidence_text_embedding, labels, class_names)
++
++    proto_loss = outputs.logits.new_zeros(())
++    if prototype_bank is not None:
++        proto_loss = prototype_bank.prototype_alignment_loss(
++            labels,
++            outputs.signal_embedding,
++            outputs.evidence_text_embedding,
++            outputs.mechanism_text_embedding,
++        )
++
++    quality_loss = outputs.quality_loss if outputs.quality_loss is not None else outputs.logits.new_zeros(())
++
++    total = (
++        cls_loss
++        + lambda_cfg["combined"] * align_combined
++        + lambda_cfg["evidence"] * align_evidence
++        + lambda_cfg["mechanism"] * align_mechanism
++        + lambda_cfg["contrast"] * contrast_loss
++        + lambda_cfg["listwise"] * listwise
++        + lambda_cfg["token"] * token_loss
++        + lambda_cfg["hardneg"] * hard_neg
++        + lambda_cfg["proto"] * proto_loss
++        + lambda_cfg["quality"] * quality_loss
++    )
++    parts = {
++        "cls": float(cls_loss.item()),
++        "combined": float(align_combined.item()),
++        "evidence": float(align_evidence.item()),
++        "mechanism": float(align_mechanism.item()),
++        "contrast": float(contrast_loss.item()),
++        "listwise": float(listwise.item()),
++        "token": float(token_loss.item()),
++        "token_entropy": float(token_entropy.item()),
++        "hardneg": float(hard_neg.item()),
++        "proto": float(proto_loss.item()),
++        "quality": float(quality_loss.item()),
++    }
++    return total, parts
++
++
++def evaluate_model(model, loader, device: torch.device, *, text_cache: dict[str, torch.Tensor], class_names: list[str], return_rows: bool = False):
++    model.eval()
++    total = 0
++    correct = 0
++    rows = []
++    with torch.no_grad():
++        for batch, recs in loader:
++            text_views = build_text_views_from_records(text_cache, recs, device)
++            batch = move_batch_to_device(batch, device)
++            outputs = model(batch, text_views)
++            preds = outputs.logits.argmax(dim=1)
++            correct += int((preds == batch.y_cls).sum().item())
++            total += int(batch.y_cls.numel())
++            if return_rows:
++                top2 = topk_modalities(outputs.modality_scores, k=2)
++                top3 = topk_modalities(outputs.modality_scores, k=3)
++                mass = aggregate_token_mass_by_modality(outputs.token_plan).detach().cpu().numpy()  # [B,4,2]
++                for i, rec in enumerate(recs):
++                    scenario = canonical_scenario_name(getattr(rec, "scenario", ""))
++                    primary = PRIMARY_MODALITY_BY_SCENARIO.get(scenario, "balanced")
++                    support = SUPPORT_MODALITIES_BY_SCENARIO.get(scenario, [])
++                    t2, t3 = top2[i], top3[i]
++                    rows.append({
++                        "sample_index": int(rec.index),
++                        "scenario": scenario,
++                        "primary": primary,
++                        "support": ";".join(support),
++                        "pred_top2": ";".join(t2),
++                        "pred_top3": ";".join(t3),
++                        "evidence_primary_in_top2": primary in t2 if primary != "balanced" else True,
++                        "evidence_primary_in_top3": primary in t3 if primary != "balanced" else True,
++                        "evidence_primary_or_support_at3": ((primary in t3) or any(x in t3 for x in support)) if primary != "balanced" else True,
++                        "evidence_weighted_consistency_at3": weighted_consistency_at3(t3, primary, support) if primary != "balanced" else 1.0,
++                        "mechanism_primary_in_top2": primary in t2 if primary != "balanced" else True,
++                        "mechanism_primary_in_top3": primary in t3 if primary != "balanced" else True,
++                        "mechanism_primary_or_support_at3": ((primary in t3) or any(x in t3 for x in support)) if primary != "balanced" else True,
++                        "mechanism_weighted_consistency_at3": weighted_consistency_at3(t3, primary, support) if primary != "balanced" else 1.0,
++                        "evidence_mass_position": float(mass[i, 0, 0]),
++                        "evidence_mass_electrical": float(mass[i, 1, 0]),
++                        "evidence_mass_thermal": float(mass[i, 2, 0]),
++                        "evidence_mass_vibration": float(mass[i, 3, 0]),
++                        "mechanism_mass_position": float(mass[i, 0, 1]),
++                        "mechanism_mass_electrical": float(mass[i, 1, 1]),
++                        "mechanism_mass_thermal": float(mass[i, 2, 1]),
++                        "mechanism_mass_vibration": float(mass[i, 3, 1]),
++                    })
++    result = {"scenario_accuracy": correct / max(1, total)}
++    if return_rows:
++        result["rows"] = rows
++    return result
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--dataset", type=Path, required=True)
++    parser.add_argument("--corpus", type=Path, required=True)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    parser.add_argument("--init", type=Path, required=True)
++    parser.add_argument("--device", type=str, default="cuda")
++    parser.add_argument("--epochs", type=int, default=16)
++    parser.add_argument("--batch-size", type=int, default=16)
++    parser.add_argument("--lr", type=float, default=2e-4)
++    parser.add_argument("--weight-decay", type=float, default=1e-4)
++    parser.add_argument("--seed", type=int, default=7)
++    parser.add_argument("--max-samples", type=int, default=0)
++    parser.add_argument("--val-ratio", type=float, default=0.15)
++    parser.add_argument("--test-ratio", type=float, default=0.15)
++    parser.add_argument("--model-dim", type=int, default=128)
++    parser.add_argument("--token-dim", type=int, default=256)
++    parser.add_argument("--text-backbone", choices=["qwen", "mock"], default="mock")
++    parser.add_argument("--qwen-path", type=Path, default=Path("/mnt/PRO6000_disk/models/Qwen/Qwen2.5-7B-Instruct"))
++    parser.add_argument("--text-batch-size", type=int, default=8)
++    parser.add_argument("--feature-mode", choices=["base", "modality_tf"], default="modality_tf")
++    parser.add_argument("--feature-chunk-size", type=int, default=2048)
++    parser.add_argument("--quality-hidden-dim", type=int, default=128)
++    parser.add_argument("--quality-drop-prob", type=float, default=0.10)
++    parser.add_argument("--quality-min-gate", type=float, default=0.10)
++    parser.add_argument("--fault-gate-hidden-dim", type=int, default=128)
++    parser.add_argument("--llm-layers", type=int, default=4)
++    parser.add_argument("--llm-heads", type=int, default=8)
++    parser.add_argument("--llm-ff", type=int, default=768)
++    parser.add_argument("--pool", choices=["cls", "mean", "attn"], default="attn")
++    parser.add_argument("--lambda-combined", type=float, default=0.20)
++    parser.add_argument("--lambda-evidence", type=float, default=0.35)
++    parser.add_argument("--lambda-mechanism", type=float, default=0.35)
++    parser.add_argument("--lambda-contrast", type=float, default=0.15)
++    parser.add_argument("--lambda-listwise", type=float, default=0.20)
++    parser.add_argument("--lambda-token", type=float, default=0.25)
++    parser.add_argument("--lambda-token-sparse", type=float, default=0.05)
++    parser.add_argument("--lambda-hardneg", type=float, default=0.20)
++    parser.add_argument("--lambda-proto", type=float, default=0.12)
++    parser.add_argument("--lambda-quality", type=float, default=0.05)
++    args = parser.parse_args()
++
++    torch.manual_seed(int(args.seed))
++    np.random.seed(int(args.seed))
++
++    arrays, records = load_decoupled_arrays(args.dataset, args.corpus, int(args.max_samples))
++    arrays, feature_meta = apply_feature_mode(arrays, str(args.feature_mode), chunk_size=int(args.feature_chunk_size))
++    labels = arrays["y_cls"].astype(np.int64)
++    train_idx, val_idx, test_idx = stratified_split_three_way(labels, float(args.val_ratio), float(args.test_ratio), int(args.seed))
++    stats = compute_normalization_stats(arrays, train_idx)
++    normalized = apply_normalization(arrays, stats)
++
++    base_dataset = DecoupledDataset(normalized, np.arange(labels.shape[0], dtype=np.int64))
++    train_loader = DataLoader(StageTextDataset(base_dataset, records, train_idx), batch_size=int(args.batch_size), shuffle=True, collate_fn=collate_with_records)
++    val_loader = DataLoader(StageTextDataset(base_dataset, records, val_idx), batch_size=int(args.batch_size), shuffle=False, collate_fn=collate_with_records)
++    test_loader = DataLoader(StageTextDataset(base_dataset, records, test_idx), batch_size=int(args.batch_size), shuffle=False, collate_fn=collate_with_records)
++
++    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
++    text_cache, text_dim = build_multiview_text_cache(args.output_dir, records, str(args.text_backbone), args.qwen_path, device, int(args.text_batch_size))
++    class_names = arrays["class_names"].astype(str).tolist()
++    input_dims = batch_input_dims(base_dataset[0])
++
++    model = Stage4TokenEvidenceAlignmentV1(
++        input_dims,
++        len(class_names),
++        int(text_dim),
++        model_dim=int(args.model_dim),
++        token_dim=int(args.token_dim),
++        num_layers=int(args.llm_layers),
++        nhead=int(args.llm_heads),
++        dim_feedforward=int(args.llm_ff),
++        pool=str(args.pool),
++        quality_hidden_dim=int(args.quality_hidden_dim),
++        modality_drop_prob=float(args.quality_drop_prob),
++        quality_min_gate=float(args.quality_min_gate),
++        fault_gate_hidden_dim=int(args.fault_gate_hidden_dim),
++    ).to(device)
++
++    load_init(model, args.init)
++    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
++    prototype_bank = SoftPrototypeBank(len(class_names), int(args.token_dim), device=device, momentum=0.97)
++
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    best_path = args.output_dir / "best.pt"
++    report_path = args.output_dir / "report.json"
++    best_val = -math.inf
++    history = []
++
++    lambda_cfg = {
++        "combined": float(args.lambda_combined),
++        "evidence": float(args.lambda_evidence),
++        "mechanism": float(args.lambda_mechanism),
++        "contrast": float(args.lambda_contrast),
++        "listwise": float(args.lambda_listwise),
++        "token": float(args.lambda_token),
++        "token_sparse": float(args.lambda_token_sparse),
++        "hardneg": float(args.lambda_hardneg),
++        "proto": float(args.lambda_proto),
++        "quality": float(args.lambda_quality),
++    }
++
++    for epoch in range(1, int(args.epochs) + 1):
++        model.train()
++        total = 0
++        correct = 0
++        loss_sum = 0.0
++        part_sums = {k: 0.0 for k in ["cls", "combined", "evidence", "mechanism", "contrast", "listwise", "token", "token_entropy", "hardneg", "proto", "quality"]}
++        for batch, recs in train_loader:
++            text_views = build_text_views_from_records(text_cache, recs, device)
++            batch = move_batch_to_device(batch, device)
++            outputs = model(batch, text_views)
++            loss, parts = compute_total_loss(outputs, batch.y_cls, recs, class_names, prototype_bank, lambda_cfg)
++            optimizer.zero_grad()
++            loss.backward()
++            optimizer.step()
++            with torch.no_grad():
++                prototype_bank.update(batch.y_cls, outputs.signal_embedding.detach(), outputs.evidence_text_embedding.detach(), outputs.mechanism_text_embedding.detach())
++            preds = outputs.logits.argmax(dim=1)
++            correct += int((preds == batch.y_cls).sum().item())
++            total += int(batch.y_cls.numel())
++            loss_sum += float(loss.item()) * int(batch.y_cls.numel())
++            for k, v in parts.items():
++                part_sums[k] += v * int(batch.y_cls.numel())
++
++        val_metrics = evaluate_model(model, val_loader, device, text_cache=text_cache, class_names=class_names, return_rows=False)
++        row = {
++            "epoch": epoch,
++            "loss": loss_sum / max(1, total),
++            "scenario_accuracy": correct / max(1, total),
++            "val_scenario_accuracy": float(val_metrics["scenario_accuracy"]),
++        }
++        for k, v in part_sums.items():
++            row[k] = v / max(1, total)
++        history.append(row)
++        print(json.dumps(row, ensure_ascii=False))
++        if float(val_metrics["scenario_accuracy"]) > best_val:
++            best_val = float(val_metrics["scenario_accuracy"])
++            torch.save({"model": model.state_dict(), "config": vars(args)}, best_path)
++
++    payload = torch.load(best_path, map_location=device, weights_only=False)
++    model.load_state_dict(payload["model"], strict=False)
++    test_metrics = evaluate_model(model, test_loader, device, text_cache=text_cache, class_names=class_names, return_rows=True)
++    rows = test_metrics["rows"]
++
++    scores_csv = args.output_dir / "test_token_alignment_scores.csv"
++    summary_json = args.output_dir / "test_token_alignment_summary.json"
++    legacy_summary_json = args.output_dir / "test_topk_consistency_summary.json"
++
++    write_rows_csv(scores_csv, rows)
++    summary = summarize_token_alignment_rows(rows)
++    save_json(summary_json, summary)
++    save_summary_json(legacy_summary_json, summarize_topk_rows(rows))
++
++    report = {
++        "experiment": "stage4_token_evidence_alignment_v1",
++        "best_checkpoint": str(best_path),
++        "best_val_scenario_accuracy": float(best_val),
++        "test_scenario_accuracy": float(test_metrics["scenario_accuracy"]),
++        "feature_mode": feature_meta,
++        "strict_modalities": STRICT_DECOUPLED_COLUMNS,
++        "token_alignment_scores_csv": str(scores_csv),
++        "token_alignment_summary_json": str(summary_json),
++        "topk_summary_json": str(legacy_summary_json),
++        "history": history,
++        "lambda_cfg": lambda_cfg,
++    }
++    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
++    print(f"report={report_path}")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_stage4_token_evidence_alignment_v1.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
++PYTHON_PATH="${PYTHON_PATH:-python}"
++DEVICE="${DEVICE:-cuda}"
++
++DATASET="${DATASET:-${PROJECT_ROOT}/derived_datasets/servo_multimodal_handoff_dataset.npz}"
++CORPUS="${CORPUS:-${PROJECT_ROOT}/derived_datasets/stage1_alignment_corpus.jsonl}"
++
++BASE_DIR="${BASE_DIR:-${SCRIPT_DIR}/models/exp1_stage4_token_evidence_alignment_v1}"
++STAGE3_INIT="${STAGE3_INIT:-${SCRIPT_DIR}/models/exp1_topk_duallevel_align_v2/stage3_topk_duallevel/best.pt}"
++STAGE4_DIR="${BASE_DIR}/stage4_token_alignment"
++
++mkdir -p "${STAGE4_DIR}"
++
++"${PYTHON_PATH}" "${SCRIPT_DIR}/train_exp1_stage4_token_evidence_alignment_v1.py"   --dataset "${DATASET}"   --corpus "${CORPUS}"   --output-dir "${STAGE4_DIR}"   --init "${STAGE3_INIT}"   --device "${DEVICE}"   --epochs "${EPOCHS:-16}"   --batch-size "${BATCH_SIZE:-16}"   --lr "${LR:-2e-4}"   --weight-decay "${WEIGHT_DECAY:-1e-4}"   --seed "${SEED:-7}"   --model-dim "${MODEL_DIM:-128}"   --token-dim "${TOKEN_DIM:-256}"   --text-backbone "${TEXT_BACKBONE:-mock}"   --feature-mode "${FEATURE_MODE:-modality_tf}"   --quality-drop-prob "${QUALITY_DROP_PROB:-0.10}"   --quality-hidden-dim "${QUALITY_HIDDEN_DIM:-128}"   --fault-gate-hidden-dim "${FAULT_GATE_HIDDEN_DIM:-128}"   --llm-layers "${LLM_LAYERS:-4}"   --llm-heads "${LLM_HEADS:-8}"   --llm-ff "${LLM_FF:-768}"   --pool "${POOL:-attn}"   --lambda-combined "${LAMBDA_COMBINED:-0.20}"   --lambda-evidence "${LAMBDA_EVIDENCE:-0.35}"   --lambda-mechanism "${LAMBDA_MECHANISM:-0.35}"   --lambda-contrast "${LAMBDA_CONTRAST:-0.15}"   --lambda-listwise "${LAMBDA_LISTWISE:-0.20}"   --lambda-token "${LAMBDA_TOKEN:-0.25}"   --lambda-token-sparse "${LAMBDA_TOKEN_SPARSE:-0.05}"   --lambda-hardneg "${LAMBDA_HARDNEG:-0.20}"   --lambda-proto "${LAMBDA_PROTO:-0.12}"   --lambda-quality "${LAMBDA_QUALITY:-0.05}"
