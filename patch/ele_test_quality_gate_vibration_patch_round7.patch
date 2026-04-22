@@ -1,0 +1,406 @@
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/exp1_decoupled_models.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/exp1_decoupled_models.py
+index afaf872..b2d8f81 100644
+--- a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/exp1_decoupled_models.py
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/exp1_decoupled_models.py
+@@ -18,3 +18,5 @@ class StageOutputs:
+     logits: Tensor
+     align_loss: Tensor | None
+     quality_loss: Tensor | None = None
++    quality_gates: Tensor | None = None
++    branch_energies: Tensor | None = None
+@@ -104,8 +106,8 @@ class DecoupledSignalTokenBackbone(nn.Module):
+     def _encode_project(self, encoder: nn.Module, x: Tensor) -> Tensor:
+         tokens, _, _ = encoder(x)
+         return self.proj(tokens)
+ 
+-    def forward(self, batch) -> tuple[Tensor, Tensor, Tensor | None]:
++    def forward(self, batch) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor]:
+         pos_in, pos_target = self._corrupt_modality(batch.pos)
+         electrical_in, electrical_target = self._corrupt_modality(batch.electrical)
+         thermal_in, thermal_target = self._corrupt_modality(batch.thermal)
+@@ -115,6 +117,7 @@ class DecoupledSignalTokenBackbone(nn.Module):
+         vibration_tokens = self._encode_project(self.vibration_encoder, vibration_in)
+ 
+         quality_loss = None
++        gates = None
+         if self.quality_estimator is not None:
+             pooled_stack = torch.stack(
+                 [
+@@ -144,6 +147,16 @@ class DecoupledSignalTokenBackbone(nn.Module):
+             thermal_tokens = thermal_tokens * gates[:, 2].view(-1, 1, 1)
+             vibration_tokens = vibration_tokens * gates[:, 3].view(-1, 1, 1)
+ 
++        branch_energies = torch.stack(
++            [
++                pos_tokens.pow(2).mean(dim=(1, 2)),
++                electrical_tokens.pow(2).mean(dim=(1, 2)),
++                thermal_tokens.pow(2).mean(dim=(1, 2)),
++                vibration_tokens.pow(2).mean(dim=(1, 2)),
++            ],
++            dim=1,
++        )
++
+         tokens = torch.cat(
+             [pos_tokens, electrical_tokens, thermal_tokens, vibration_tokens],
+             dim=1,
+@@ -151,3 +163,3 @@ class DecoupledSignalTokenBackbone(nn.Module):
+         )
+         pooled = F.normalize(tokens.mean(dim=1), dim=-1)
+-        return tokens, pooled, quality_loss
++        return tokens, pooled, quality_loss, gates, branch_energies
+@@ -183,5 +195,11 @@ class Stage1DecoupledClassifier(nn.Module):
+         )
+ 
+     def forward(self, batch) -> StageOutputs:
+-        _tokens, pooled, quality_loss = self.backbone(batch)
+-        return StageOutputs(logits=self.head(pooled), align_loss=None, quality_loss=quality_loss)
++        _tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
++        return StageOutputs(
++            logits=self.head(pooled),
++            align_loss=None,
++            quality_loss=quality_loss,
++            quality_gates=quality_gates,
++            branch_energies=branch_energies,
++        )
+@@ -244,9 +262,15 @@ class Stage2DecoupledClassifier(nn.Module):
+         )
+ 
+     def forward(self, batch) -> StageOutputs:
+-        tokens, _pooled, quality_loss = self.backbone(batch)
++        tokens, _pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+         cls = self.cls.expand(tokens.shape[0], -1, -1)
+         seq = torch.cat([cls, tokens], dim=1)
+         seq = self.encoder(seq)
+         seq = self.norm(seq)
+-        return StageOutputs(logits=self.head(self.pool(seq)), align_loss=None, quality_loss=quality_loss)
++        return StageOutputs(
++            logits=self.head(self.pool(seq)),
++            align_loss=None,
++            quality_loss=quality_loss,
++            quality_gates=quality_gates,
++            branch_energies=branch_energies,
++        )
+@@ -292,11 +316,13 @@ class Stage3DecoupledClassifier(nn.Module):
+         )
+ 
+     def forward(self, batch, text_embeddings: Tensor) -> StageOutputs:
+-        _tokens, pooled, quality_loss = self.backbone(batch)
++        _tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+         logits = self.head(pooled)
+         text_vec = F.normalize(self.text_proj(text_embeddings), dim=-1)
+         return StageOutputs(
+             logits=logits,
+             align_loss=info_nce(pooled, text_vec, temperature=self.temperature),
+             quality_loss=quality_loss,
++            quality_gates=quality_gates,
++            branch_energies=branch_energies,
+         )
+@@ -357,7 +385,7 @@ class Stage4DecoupledClassifier(nn.Module):
+         )
+ 
+     def forward(self, batch, text_embeddings: Tensor) -> StageOutputs:
+-        signal_tokens, pooled, quality_loss = self.backbone(batch)
++        signal_tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+         text_token = F.normalize(self.text_proj(text_embeddings), dim=-1).unsqueeze(1)
+         cls = self.cls.expand(signal_tokens.shape[0], -1, -1)
+         seq = torch.cat([cls, signal_tokens, text_token], dim=1)
+@@ -367,4 +395,10 @@ class Stage4DecoupledClassifier(nn.Module):
+         pooled_seq = self.pool(seq, text_index=seq.shape[1] - 1)
+         logits = self.head(pooled_seq)
+         align_loss = info_nce(pooled, text_token.squeeze(1), temperature=self.temperature)
+-        return StageOutputs(logits=logits, align_loss=align_loss, quality_loss=quality_loss)
++        return StageOutputs(
++            logits=logits,
++            align_loss=align_loss,
++            quality_loss=quality_loss,
++            quality_gates=quality_gates,
++            branch_energies=branch_energies,
++        )
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_decoupled_stages.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_decoupled_stages.py
+index caabf8e..4950fb2 100644
+--- a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_decoupled_stages.py
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_decoupled_stages.py
+@@ -13,5 +13,5 @@ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
+ 
+-from servo_diagnostic.multimodal_method import load_multimodal_arrays
++from servo_diagnostic.multimodal_method import FAMILY_BY_SCENARIO, load_multimodal_arrays
+ from servo_llm_alignment.dataset import load_alignment_records
+ from servo_llm_alignment.text_encoder import MockFrozenTextEncoder, QwenFrozenTextEncoder
+@@ -42,6 +42,7 @@ STRICT_DECOUPLED_COLUMNS = {
+ class DecoupledBatch:
+     pos: torch.Tensor
+     electrical: torch.Tensor
+     thermal: torch.Tensor
+     vibration: torch.Tensor
++    sample_index: torch.Tensor
+     y_cls: torch.Tensor
+@@ -74,6 +75,7 @@ class DecoupledDataset(Dataset):
+             pos=torch.from_numpy(self.arrays["X_pos"][item]).float(),
+             electrical=torch.from_numpy(self.arrays["X_electrical"][item]).float(),
+             thermal=torch.from_numpy(self.arrays["X_thermal"][item]).float(),
+             vibration=torch.from_numpy(self.arrays["X_vibration"][item]).float(),
++            sample_index=torch.tensor(item, dtype=torch.long),
+             y_cls=torch.tensor(self.arrays["y_cls"][item], dtype=torch.long),
+         )
+@@ -102,6 +104,7 @@ def collate_decoupled_batch(items: list[DecoupledBatch]) -> DecoupledBatch:
+         pos=torch.stack([x.pos for x in items], dim=0),
+         electrical=torch.stack([x.electrical for x in items], dim=0),
+         thermal=torch.stack([x.thermal for x in items], dim=0),
+         vibration=torch.stack([x.vibration for x in items], dim=0),
++        sample_index=torch.stack([x.sample_index for x in items], dim=0),
+         y_cls=torch.stack([x.y_cls for x in items], dim=0),
+     )
+@@ -115,6 +118,7 @@ def move_batch_to_device(batch: DecoupledBatch, device: torch.device) -> Decoupl
+         pos=batch.pos.to(device),
+         electrical=batch.electrical.to(device),
+         thermal=batch.thermal.to(device),
+         vibration=batch.vibration.to(device),
++        sample_index=batch.sample_index.to(device),
+         y_cls=batch.y_cls.to(device),
+     )
+@@ -337,6 +341,9 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
+     quality_sum = 0.0
+     all_preds = []
+     all_targets = []
++    all_sample_indices = []
++    all_quality_gates = []
++    all_branch_energies = []
+     with torch.no_grad():
+         for batch in loader:
+             if isinstance(batch, tuple):
+@@ -359,6 +366,11 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
+             if return_predictions:
+                 all_preds.extend(preds.cpu().numpy().tolist())
+                 all_targets.extend(batch.y_cls.cpu().numpy().tolist())
++                all_sample_indices.extend(batch.sample_index.cpu().numpy().tolist())
++                if getattr(outputs, "quality_gates", None) is not None:
++                    all_quality_gates.extend(outputs.quality_gates.cpu().numpy().tolist())
++                if getattr(outputs, "branch_energies", None) is not None:
++                    all_branch_energies.extend(outputs.branch_energies.cpu().numpy().tolist())
+     result = {
+         "loss": loss_sum / max(1, total),
+         "scenario_accuracy": correct / max(1, total),
+@@ -370,8 +383,115 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
+     if return_predictions:
+         result["predictions"] = all_preds
+         result["targets"] = all_targets
++        result["sample_indices"] = all_sample_indices
++        result["quality_gates"] = all_quality_gates
++        result["branch_energies"] = all_branch_energies
+     return result
+ 
++
++BRANCH_NAMES = ["position", "electrical", "thermal", "vibration"]
++MECHANICAL_RELATED_FAMILIES = {"mechanical_fault", "friction_increase", "jam", "load_disturbance"}
++
++
++def _mean_or_nan(values: list[float]) -> float:
++    return float(sum(values) / len(values)) if values else float("nan")
++
++
++def _summarize_gate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
++    if not rows:
++        return {"num_samples": 0}
++    gate_means = {
++        branch: _mean_or_nan([float(row[f"{branch}_gate"]) for row in rows])
++        for branch in BRANCH_NAMES
++    }
++    energy_means = {
++        branch: _mean_or_nan([float(row[f"{branch}_energy"]) for row in rows])
++        for branch in BRANCH_NAMES
++    }
++    top_gate_counts = {branch: 0 for branch in BRANCH_NAMES}
++    for row in rows:
++        top_branch = max(BRANCH_NAMES, key=lambda branch: float(row[f"{branch}_gate"]))
++        top_gate_counts[top_branch] += 1
++    num_samples = len(rows)
++    return {
++        "num_samples": num_samples,
++        "gate_means": gate_means,
++        "energy_means": energy_means,
++        "top_gate_counts": top_gate_counts,
++        "top_gate_fraction": {branch: float(count / num_samples) for branch, count in top_gate_counts.items()},
++        "vibration_top_gate_fraction": float(top_gate_counts["vibration"] / num_samples),
++    }
++
++
++def export_quality_gate_artifacts(
++    output_dir: Path,
++    split_name: str,
++    metrics: dict[str, Any],
++    class_names: np.ndarray,
++) -> dict[str, str]:
++    gates = metrics.get("quality_gates") or []
++    if not gates:
++        return {}
++    energies = metrics.get("branch_energies") or []
++    sample_indices = metrics.get("sample_indices") or []
++    predictions = metrics.get("predictions") or []
++    targets = metrics.get("targets") or []
++    class_name_list = [str(item) for item in class_names.astype(str).tolist()]
++
++    rows: list[dict[str, Any]] = []
++    for i, gate_row in enumerate(gates):
++        energy_row = energies[i] if i < len(energies) else [float("nan")] * len(BRANCH_NAMES)
++        target_idx = int(targets[i])
++        pred_idx = int(predictions[i])
++        target_name = class_name_list[target_idx]
++        pred_name = class_name_list[pred_idx]
++        target_family = FAMILY_BY_SCENARIO.get(target_name, "unknown")
++        pred_family = FAMILY_BY_SCENARIO.get(pred_name, "unknown")
++        row: dict[str, Any] = {
++            "sample_index": int(sample_indices[i]) if i < len(sample_indices) else i,
++            "target_idx": target_idx,
++            "target_scenario": target_name,
++            "target_family": target_family,
++            "pred_idx": pred_idx,
++            "pred_scenario": pred_name,
++            "pred_family": pred_family,
++            "mechanical_related": int(target_family in MECHANICAL_RELATED_FAMILIES),
++        }
++        for branch, gate_value, energy_value in zip(BRANCH_NAMES, gate_row, energy_row):
++            row[f"{branch}_gate"] = float(gate_value)
++            row[f"{branch}_energy"] = float(energy_value)
++        rows.append(row)
++
++    csv_path = output_dir / f"{split_name}_quality_gates.csv"
++    with csv_path.open("w", encoding="utf-8", newline="") as f:
++        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
++        writer.writeheader()
++        writer.writerows(rows)
++
++    class_summary = {
++        class_name: _summarize_gate_rows([row for row in rows if row["target_scenario"] == class_name])
++        for class_name in sorted({str(row["target_scenario"]) for row in rows})
++    }
++    family_summary = {
++        family_name: _summarize_gate_rows([row for row in rows if row["target_family"] == family_name])
++        for family_name in sorted({str(row["target_family"]) for row in rows})
++    }
++    mechanical_rows = [row for row in rows if row["target_family"] in MECHANICAL_RELATED_FAMILIES]
++    non_mechanical_rows = [row for row in rows if row["target_family"] not in MECHANICAL_RELATED_FAMILIES]
++    summary = {
++        "split": split_name,
++        "branch_names": BRANCH_NAMES,
++        "mechanical_related_families": sorted(MECHANICAL_RELATED_FAMILIES),
++        "overall": _summarize_gate_rows(rows),
++        "mechanical_related": _summarize_gate_rows(mechanical_rows),
++        "non_mechanical": _summarize_gate_rows(non_mechanical_rows),
++        "by_true_family": family_summary,
++        "by_true_class": class_summary,
++    }
++    summary_path = output_dir / f"{split_name}_quality_gate_summary.json"
++    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
++    return {"csv": str(csv_path), "summary_json": str(summary_path)}
++
+ 
+ def load_init(model, init_path: Path) -> None:
+     payload = torch.load(init_path, map_location="cpu", weights_only=False)
+@@ -555,4 +671,6 @@ def main() -> None:
+     test_results = evaluate(model, test_loader, device, text_cache=text_cache if need_text else None, label_smoothing=float(args.label_smoothing), lambda_align=float(args.lambda_align), return_predictions=True)
++    gate_artifacts = export_quality_gate_artifacts(args.output_dir, "test", test_results, arrays["class_names"])
++
+     cm_output = {
+         "train_confusion_matrix": confusion_matrix(train_results["targets"], train_results["predictions"]).tolist(),
+         "val_confusion_matrix": confusion_matrix(val_results["targets"], val_results["predictions"]).tolist(),
+@@ -596,4 +714,5 @@ def main() -> None:
+         },
++        "gate_artifacts": gate_artifacts,
+         "split": {
+             "mode": "random_stratified",
+             "train": int(train_idx.shape[0]),
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_tf_control_curriculum.sh b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_tf_control_curriculum.sh
+index c344663..f934de7 100644
+--- a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_tf_control_curriculum.sh
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_tf_control_curriculum.sh
+@@ -15,6 +15,14 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"
+ SEED="${SEED:-7}"
+ FEATURE_MODE="${FEATURE_MODE:-modality_tf}"
+ RUN_STAGE4="${RUN_STAGE4:-1}"
++QUALITY_AWARE_FUSION="${QUALITY_AWARE_FUSION:-1}"
++QUALITY_DROP_PROB="${QUALITY_DROP_PROB:-0.10}"
++QUALITY_HIDDEN_DIM="${QUALITY_HIDDEN_DIM:-128}"
++QUALITY_MIN_GATE="${QUALITY_MIN_GATE:-0.10}"
++LAMBDA_QUALITY="${LAMBDA_QUALITY:-0.05}"
++
++QUALITY_FLAGS=""
++if [[ "${QUALITY_AWARE_FUSION}" == "1" ]]; then QUALITY_FLAGS="--quality-aware-fusion --quality-hidden-dim ${QUALITY_HIDDEN_DIM} --quality-drop-prob ${QUALITY_DROP_PROB} --quality-min-gate ${QUALITY_MIN_GATE} --lambda-quality ${LAMBDA_QUALITY}"; fi
+ 
+ STAGE1_EPOCHS="${STAGE1_EPOCHS:-36}"
+ STAGE2_EPOCHS="${STAGE2_EPOCHS:-20}"
+@@ -29,7 +36,7 @@ STAGE4_DIR="${OUT_ROOT}/stage4_signal_text_llm"
+ "${PYTHON_PATH}" experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+   --stage 1 --dataset "${DATASET}" --output-dir "${STAGE1_DIR}" --device "${DEVICE}" \
+   --epochs "${STAGE1_EPOCHS}" --batch-size "${BATCH_SIZE}" --lr 1e-3 --weight-decay 1e-4 --label-smoothing 0.05 \
+-  --model-dim 128 --token-dim 256 --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}"
++  --model-dim 128 --token-dim 256 --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}" ${QUALITY_FLAGS}
+ 
+ "${PYTHON_PATH}" experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+   --stage 2 --dataset "${DATASET}" --output-dir "${STAGE2_DIR}" --init "${STAGE1_DIR}/best.pt" --device "${DEVICE}" \
+@@ -37,11 +44,11 @@ STAGE4_DIR="${OUT_ROOT}/stage4_signal_text_llm"
+-  --model-dim 128 --token-dim 256 --fusion-layers 2 --fusion-heads 8 --fusion-ff 768 --pool attn \
+-  --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}"
++  --model-dim 128 --token-dim 256 --fusion-layers 2 --fusion-heads 8 --fusion-ff 768 --pool attn \
++  --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}" ${QUALITY_FLAGS}
+ 
+ "${PYTHON_PATH}" experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+   --stage 3 --dataset "${DATASET}" --corpus "${CORPUS}" --output-dir "${STAGE3_DIR}" --init "${STAGE2_DIR}/best.pt" --device "${DEVICE}" \
+   --epochs "${STAGE3_EPOCHS}" --batch-size "${BATCH_SIZE}" --lr 2e-4 --weight-decay 1e-4 --label-smoothing 0.03 --lambda-align 0.15 \
+   --model-dim 128 --token-dim 256 --text-backbone "${TEXT_BACKBONE}" --qwen-path "${QWEN_PATH}" --text-batch-size 8 \
+-  --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}"
++  --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}" ${QUALITY_FLAGS}
+ 
+ if [[ "${RUN_STAGE4}" == "1" ]]; then
+   "${PYTHON_PATH}" experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+@@ -52,4 +59,4 @@ if [[ "${RUN_STAGE4}" == "1" ]]; then
+     --epochs "${STAGE4_EPOCHS}" --batch-size "${BATCH_SIZE}" --lr 2e-4 --weight-decay 1e-4 --label-smoothing 0.03 --lambda-align 0.08 \
+     --model-dim 128 --token-dim 256 --text-backbone "${TEXT_BACKBONE}" --qwen-path "${QWEN_PATH}" --text-batch-size 8 \
+-    --llm-layers 4 --llm-heads 8 --llm-ff 768 --pool attn --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}"
++    --llm-layers 4 --llm-heads 8 --llm-ff 768 --pool attn --seed "${SEED}" --max-samples "${MAX_SAMPLES}" --feature-mode "${FEATURE_MODE}" ${QUALITY_FLAGS}
+ fi
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_ablation_async.sh b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_ablation_async.sh
+index 7602625..9e4f2db 100644
+--- a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_ablation_async.sh
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_decoupled_modality_ablation_async.sh
+@@ -13,6 +13,14 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"
+ SEED="${SEED:-7}"
+ FEATURE_MODE="${FEATURE_MODE:-modality_tf}"
+ GPU_MAP="${GPU_MAP:-0,1,2,3,0}"
++QUALITY_AWARE_FUSION="${QUALITY_AWARE_FUSION:-1}"
++QUALITY_DROP_PROB="${QUALITY_DROP_PROB:-0.10}"
++QUALITY_HIDDEN_DIM="${QUALITY_HIDDEN_DIM:-128}"
++QUALITY_MIN_GATE="${QUALITY_MIN_GATE:-0.10}"
++LAMBDA_QUALITY="${LAMBDA_QUALITY:-0.05}"
++
++QUALITY_FLAGS=""
++if [[ "${QUALITY_AWARE_FUSION}" == "1" ]]; then QUALITY_FLAGS="--quality-aware-fusion --quality-hidden-dim ${QUALITY_HIDDEN_DIM} --quality-drop-prob ${QUALITY_DROP_PROB} --quality-min-gate ${QUALITY_MIN_GATE} --lambda-quality ${LAMBDA_QUALITY}"; fi
+ 
+ mkdir -p "${ROOT_OUT_DIR}"
+ mkdir -p "${ROOT_OUT_DIR}/logs"
+@@ -53,21 +60,21 @@ for i in "${!EXPERIMENT_NAMES[@]}"; do
+     export PYTHONPATH=.
+     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+       --stage 1 --dataset '${DATASET}' --output-dir '${out_root}/stage1_encoder_cls' --device cuda \
+       --epochs 24 --batch-size '${BATCH_SIZE}' --lr 1e-3 --weight-decay 1e-4 --label-smoothing 0.05 \
+-      --model-dim 128 --token-dim 256 --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags} && \
++      --model-dim 128 --token-dim 256 --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_FLAGS} ${flags} && \
+     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+       --stage 2 --dataset '${DATASET}' --output-dir '${out_root}/stage2_signal_fusion' --init '${out_root}/stage1_encoder_cls/best.pt' --device cuda \
+       --epochs 20 --batch-size '${BATCH_SIZE}' --lr 3e-4 --weight-decay 1e-4 --label-smoothing 0.05 \
+       --model-dim 128 --token-dim 256 --fusion-layers 2 --fusion-heads 8 --fusion-ff 768 --pool attn \
+-      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags} && \
++      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_FLAGS} ${flags} && \
+     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+       --stage 3 --dataset '${DATASET}' --corpus '${CORPUS}' --output-dir '${out_root}/stage3_signal_text_align' --init '${out_root}/stage2_signal_fusion/best.pt' --device cuda \
+       --epochs 16 --batch-size '${BATCH_SIZE}' --lr 2e-4 --weight-decay 1e-4 --label-smoothing 0.03 --lambda-align 0.15 \
+       --model-dim 128 --token-dim 256 --text-backbone '${TEXT_BACKBONE}' --qwen-path '${QWEN_PATH}' --text-batch-size 8 \
+-      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags} && \
++      --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_FLAGS} ${flags} && \
+     '${PYTHON_PATH}' experiments_smoke_20260316/train_exp1_decoupled_stages.py \
+       --stage 4 --dataset '${DATASET}' --corpus '${CORPUS}' --output-dir '${out_root}/stage4_signal_text_llm' --init '${out_root}/stage3_signal_text_align/best.pt' --device cuda \
+       --epochs 16 --batch-size '${BATCH_SIZE}' --lr 2e-4 --weight-decay 1e-4 --label-smoothing 0.03 --lambda-align 0.08 \
+       --model-dim 128 --token-dim 256 --text-backbone '${TEXT_BACKBONE}' --qwen-path '${QWEN_PATH}' --text-batch-size 8 \
+-      --llm-layers 4 --llm-heads 8 --llm-ff 768 --pool attn --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${flags}
++      --llm-layers 4 --llm-heads 8 --llm-ff 768 --pool attn --seed '${SEED}' --max-samples '${MAX_SAMPLES}' --feature-mode '${FEATURE_MODE}' ${QUALITY_FLAGS} ${flags}
+   " > "${log_file}" 2>&1 < /dev/null &

@@ -202,6 +202,46 @@ SCENARIO_SIGNAL_CUES: dict[str, list[str]] = {
     ],
 }
 
+PRIMARY_MODALITY_BY_SCENARIO: dict[str, str] = {
+    "normal": "balanced",
+    "load_disturbance_severe": "position",
+    "friction_wear_mild": "electrical",
+    "friction_wear_severe": "electrical",
+    "jam_fault": "position",
+    "intermittent_jam_fault": "position",
+    "current_sensor_bias": "electrical",
+    "speed_sensor_scale": "position",
+    "position_sensor_bias": "position",
+    "winding_resistance_rise": "electrical",
+    "bus_voltage_sag_fault": "electrical",
+    "backlash_growth": "position",
+    "thermal_saturation": "thermal",
+    "motor_encoder_freeze": "position",
+    "partial_demagnetization": "electrical",
+    "inverter_voltage_loss": "electrical",
+    "bearing_defect": "vibration",
+}
+
+SUPPORT_MODALITIES_BY_SCENARIO: dict[str, list[str]] = {
+    "normal": ["position", "electrical", "thermal", "vibration"],
+    "load_disturbance_severe": ["electrical", "thermal"],
+    "friction_wear_mild": ["position", "thermal"],
+    "friction_wear_severe": ["position", "thermal"],
+    "jam_fault": ["electrical", "vibration"],
+    "intermittent_jam_fault": ["electrical", "vibration"],
+    "current_sensor_bias": ["position"],
+    "speed_sensor_scale": ["electrical"],
+    "position_sensor_bias": ["electrical"],
+    "winding_resistance_rise": ["thermal", "position"],
+    "bus_voltage_sag_fault": ["position"],
+    "backlash_growth": ["vibration", "electrical"],
+    "thermal_saturation": ["electrical", "position"],
+    "motor_encoder_freeze": ["electrical"],
+    "partial_demagnetization": ["position", "thermal"],
+    "inverter_voltage_loss": ["position", "vibration"],
+    "bearing_defect": ["position", "electrical"],
+}
+
 
 SCENARIO_CONTRAST_CUES: dict[str, list[str]] = {
     "normal": [

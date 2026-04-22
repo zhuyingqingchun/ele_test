@@ -27,6 +27,14 @@ class StageOutputs:
     quality_loss: Tensor | None = None
     quality_gates: Tensor | None = None
     branch_energies: Tensor | None = None
+    modality_embeddings: Tensor | None = None
+    modality_names: tuple[str, ...] | None = None
+    fault_gates: Tensor | None = None
+    fault_gate_logits: Tensor | None = None
+    evidence_scores: Tensor | None = None
+    mechanism_scores: Tensor | None = None
+    contrast_scores: Tensor | None = None
+    vibration_branch_weights: Tensor | None = None
 
 
 class SequencePooling(nn.Module):
@@ -68,6 +76,55 @@ class ModalityQualityEstimator(nn.Module):
         gates = self.min_gate + (1.0 - self.min_gate) * scores
         loss = F.binary_cross_entropy_with_logits(logits, targets) if targets is not None else None
         return gates, loss
+
+
+class FaultAwareGate(nn.Module):
+    """Fault-aware gate that considers modality embeddings, pooled signal, evidence and mechanism vectors."""
+
+    def __init__(self, token_dim: int, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(token_dim * 4),
+            nn.Linear(token_dim * 4, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.10),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        modality_embeddings: Tensor,
+        pooled_signal: Tensor,
+        evidence_vec: Tensor,
+        mechanism_vec: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Args:
+            modality_embeddings: [B, 4, token_dim] - modality-level embeddings
+            pooled_signal: [B, token_dim] - pooled signal representation
+            evidence_vec: [B, token_dim] - evidence text vector
+            mechanism_vec: [B, token_dim] - mechanism text vector
+        Returns:
+            gates: [B, 4] - fault-aware gates for each modality
+            logits: [B, 4] - raw logits before sigmoid
+        """
+        B, num_modalities, token_dim = modality_embeddings.shape
+
+        # Expand pooled signal and text vectors to match modality embeddings
+        pooled_expand = pooled_signal.unsqueeze(1).expand(-1, num_modalities, -1)  # [B, 4, token_dim]
+        evidence_expand = evidence_vec.unsqueeze(1).expand(-1, num_modalities, -1)  # [B, 4, token_dim]
+        mechanism_expand = mechanism_vec.unsqueeze(1).expand(-1, num_modalities, -1)  # [B, 4, token_dim]
+
+        # Concatenate all features: [B, 4, token_dim * 4]
+        features = torch.cat([modality_embeddings, pooled_expand, evidence_expand, mechanism_expand], dim=-1)
+
+        # Compute logits for each modality
+        logits = self.net(features).squeeze(-1)  # [B, 4]
+
+        # Apply sigmoid to get gates
+        gates = torch.sigmoid(logits)
+
+        return gates, logits
 
 
 class DecoupledSignalTokenBackbone(nn.Module):
@@ -121,7 +178,7 @@ class DecoupledSignalTokenBackbone(nn.Module):
         tokens, _, _ = encoder(x)
         return self.proj(tokens)
 
-    def forward(self, batch) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor]:
+    def forward(self, batch) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor, Tensor]:
         pos_in, pos_target = self._corrupt_modality(batch.pos)
         electrical_in, electrical_target = self._corrupt_modality(batch.electrical)
         thermal_in, thermal_target = self._corrupt_modality(batch.thermal)
@@ -169,13 +226,25 @@ class DecoupledSignalTokenBackbone(nn.Module):
             ],
             dim=1,
         )
+        modality_embeddings = F.normalize(
+            torch.stack(
+                [
+                    pos_tokens.mean(dim=1),
+                    electrical_tokens.mean(dim=1),
+                    thermal_tokens.mean(dim=1),
+                    vibration_tokens.mean(dim=1),
+                ],
+                dim=1,
+            ),
+            dim=-1,
+        )
 
         tokens = torch.cat(
             [pos_tokens, electrical_tokens, thermal_tokens, vibration_tokens],
             dim=1,
         )
         pooled = F.normalize(tokens.mean(dim=1), dim=-1)
-        return tokens, pooled, quality_loss, gates, branch_energies
+        return tokens, pooled, quality_loss, gates, branch_energies, modality_embeddings
 
 
 class Stage1DecoupledClassifier(nn.Module):
@@ -210,13 +279,15 @@ class Stage1DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch) -> StageOutputs:
-        _tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+        _tokens, pooled, quality_loss, quality_gates, branch_energies, modality_embeddings = self.backbone(batch)
         return StageOutputs(
             logits=self.head(pooled),
             align_loss=None,
             quality_loss=quality_loss,
             quality_gates=quality_gates,
             branch_energies=branch_energies,
+            modality_embeddings=modality_embeddings,
+            modality_names=("position", "electrical", "thermal", "vibration"),
         )
 
 
@@ -269,7 +340,7 @@ class Stage2DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch) -> StageOutputs:
-        tokens, _pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+        tokens, _pooled, quality_loss, quality_gates, branch_energies, modality_embeddings = self.backbone(batch)
         cls = self.cls.expand(tokens.shape[0], -1, -1)
         seq = torch.cat([cls, tokens], dim=1)
         seq = self.encoder(seq)
@@ -280,6 +351,8 @@ class Stage2DecoupledClassifier(nn.Module):
             quality_loss=quality_loss,
             quality_gates=quality_gates,
             branch_energies=branch_energies,
+            modality_embeddings=modality_embeddings,
+            modality_names=("position", "electrical", "thermal", "vibration"),
         )
 
 
@@ -324,7 +397,7 @@ class Stage3DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch, text_embeddings: Tensor) -> StageOutputs:
-        _tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+        _tokens, pooled, quality_loss, quality_gates, branch_energies, modality_embeddings = self.backbone(batch)
         logits = self.head(pooled)
         text_vec = F.normalize(self.text_proj(text_embeddings), dim=-1)
         return StageOutputs(
@@ -333,6 +406,8 @@ class Stage3DecoupledClassifier(nn.Module):
             quality_loss=quality_loss,
             quality_gates=quality_gates,
             branch_energies=branch_energies,
+            modality_embeddings=modality_embeddings,
+            modality_names=("position", "electrical", "thermal", "vibration"),
         )
 
 
@@ -394,7 +469,7 @@ class Stage4DecoupledClassifier(nn.Module):
         )
 
     def forward(self, batch, text_embeddings: Tensor) -> StageOutputs:
-        signal_tokens, pooled, quality_loss, quality_gates, branch_energies = self.backbone(batch)
+        signal_tokens, pooled, quality_loss, quality_gates, branch_energies, modality_embeddings = self.backbone(batch)
         text_token = F.normalize(self.text_proj(text_embeddings), dim=-1).unsqueeze(1)
         cls = self.cls.expand(signal_tokens.shape[0], -1, -1)
         seq = torch.cat([cls, signal_tokens, text_token], dim=1)
@@ -409,4 +484,244 @@ class Stage4DecoupledClassifier(nn.Module):
             quality_loss=quality_loss,
             quality_gates=quality_gates,
             branch_energies=branch_energies,
+            modality_embeddings=modality_embeddings,
+            modality_names=("position", "electrical", "thermal", "vibration"),
+        )
+
+
+class Stage3DecoupledClassifierWithFaultAware(nn.Module):
+    """Stage 3 with fault-aware gate and multi-view alignment."""
+
+    def __init__(
+        self,
+        input_dims: dict[str, int],
+        num_classes: int,
+        text_dim: int,
+        model_dim: int = 128,
+        token_dim: int = 256,
+        dropout: float = 0.10,
+        temperature: float = 0.07,
+        quality_aware_fusion: bool = False,
+        quality_hidden_dim: int = 128,
+        modality_drop_prob: float = 0.0,
+        quality_min_gate: float = 0.10,
+        fault_aware_gate: bool = False,
+        fault_gate_hidden_dim: int = 128,
+        multiview_alignment: bool = False,
+    ) -> None:
+        super().__init__()
+        self.temperature = temperature
+        self.fault_aware_gate = fault_aware_gate
+        self.multiview_alignment = multiview_alignment
+        self.backbone = DecoupledSignalTokenBackbone(
+            input_dims,
+            model_dim=model_dim,
+            token_dim=token_dim,
+            quality_aware_fusion=quality_aware_fusion,
+            quality_hidden_dim=quality_hidden_dim,
+            modality_drop_prob=modality_drop_prob,
+            quality_min_gate=quality_min_gate,
+        )
+        self.text_proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(token_dim, num_classes),
+        )
+        if fault_aware_gate:
+            self.fault_gate = FaultAwareGate(token_dim, hidden_dim=fault_gate_hidden_dim)
+        else:
+            self.fault_gate = None
+
+    def forward(
+        self,
+        batch,
+        text_embeddings: dict[str, Tensor] | Tensor,
+    ) -> StageOutputs:
+        _tokens, pooled, quality_loss, quality_gates, branch_energies, modality_embeddings = self.backbone(batch)
+        logits = self.head(pooled)
+
+        # Handle multi-view text embeddings
+        if isinstance(text_embeddings, dict):
+            combined_text = text_embeddings.get("combined", text_embeddings.get("evidence", list(text_embeddings.values())[0]))
+            evidence_text = text_embeddings.get("evidence", combined_text)
+            mechanism_text = text_embeddings.get("mechanism", combined_text)
+            contrast_text = text_embeddings.get("contrast", combined_text)
+        else:
+            combined_text = evidence_text = mechanism_text = contrast_text = text_embeddings
+
+        # Project text embeddings
+        combined_vec = F.normalize(self.text_proj(combined_text), dim=-1)
+        evidence_vec = F.normalize(self.text_proj(evidence_text), dim=-1)
+        mechanism_vec = F.normalize(self.text_proj(mechanism_text), dim=-1)
+        contrast_vec = F.normalize(self.text_proj(contrast_text), dim=-1)
+
+        # Compute alignment losses
+        align_loss = info_nce(pooled, combined_vec, temperature=self.temperature)
+
+        if self.multiview_alignment:
+            # Multi-view alignment: evidence and mechanism
+            evidence_align = info_nce(pooled, evidence_vec, temperature=self.temperature)
+            mechanism_align = info_nce(pooled, mechanism_vec, temperature=self.temperature)
+            # Contrast rejection: push away from contrast view
+            contrast_sim = (pooled @ contrast_vec.t()) / self.temperature
+            contrast_loss = F.cross_entropy(contrast_sim, torch.arange(contrast_sim.shape[0], device=contrast_sim.device))
+            align_loss = align_loss + 0.5 * evidence_align + 0.5 * mechanism_align - 0.3 * contrast_loss
+
+        # Fault-aware gate
+        fault_gates = None
+        fault_gate_logits = None
+        if self.fault_gate is not None:
+            fault_gates, fault_gate_logits = self.fault_gate(
+                modality_embeddings, pooled, evidence_vec, mechanism_vec
+            )
+
+        return StageOutputs(
+            logits=logits,
+            align_loss=align_loss,
+            quality_loss=quality_loss,
+            quality_gates=quality_gates,
+            branch_energies=branch_energies,
+            modality_embeddings=modality_embeddings,
+            modality_names=("position", "electrical", "thermal", "vibration"),
+            fault_gates=fault_gates,
+            fault_gate_logits=fault_gate_logits,
+        )
+
+
+class Stage4DecoupledClassifierWithFaultAware(nn.Module):
+    """Stage 4 with fault-aware gate and multi-view alignment."""
+
+    def __init__(
+        self,
+        input_dims: dict[str, int],
+        num_classes: int,
+        text_dim: int,
+        model_dim: int = 128,
+        token_dim: int = 256,
+        num_layers: int = 4,
+        nhead: int = 8,
+        dim_feedforward: int = 768,
+        dropout: float = 0.10,
+        temperature: float = 0.07,
+        pool: str = "cls",
+        quality_aware_fusion: bool = False,
+        quality_hidden_dim: int = 128,
+        modality_drop_prob: float = 0.0,
+        quality_min_gate: float = 0.10,
+        fault_aware_gate: bool = False,
+        fault_gate_hidden_dim: int = 128,
+        multiview_alignment: bool = False,
+    ) -> None:
+        super().__init__()
+        self.temperature = temperature
+        self.fault_aware_gate = fault_aware_gate
+        self.multiview_alignment = multiview_alignment
+        self.backbone = DecoupledSignalTokenBackbone(
+            input_dims,
+            model_dim=model_dim,
+            token_dim=token_dim,
+            quality_aware_fusion=quality_aware_fusion,
+            quality_hidden_dim=quality_hidden_dim,
+            modality_drop_prob=modality_drop_prob,
+            quality_min_gate=quality_min_gate,
+        )
+        self.text_proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=token_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.cls = nn.Parameter(torch.zeros(1, 1, token_dim))
+        self.norm = nn.LayerNorm(token_dim)
+        self.pool = SequencePooling(token_dim, pool)
+        self.head = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(token_dim, num_classes),
+        )
+        if fault_aware_gate:
+            self.fault_gate = FaultAwareGate(token_dim, hidden_dim=fault_gate_hidden_dim)
+        else:
+            self.fault_gate = None
+
+    def forward(
+        self,
+        batch,
+        text_embeddings: dict[str, Tensor] | Tensor,
+    ) -> StageOutputs:
+        signal_tokens, pooled, quality_loss, quality_gates, branch_energies, modality_embeddings = self.backbone(batch)
+
+        # Handle multi-view text embeddings
+        if isinstance(text_embeddings, dict):
+            combined_text = text_embeddings.get("combined", text_embeddings.get("evidence", list(text_embeddings.values())[0]))
+            evidence_text = text_embeddings.get("evidence", combined_text)
+            mechanism_text = text_embeddings.get("mechanism", combined_text)
+            contrast_text = text_embeddings.get("contrast", combined_text)
+        else:
+            combined_text = evidence_text = mechanism_text = contrast_text = text_embeddings
+
+        # Project text embeddings
+        combined_vec = F.normalize(self.text_proj(combined_text), dim=-1).unsqueeze(1)
+        evidence_vec = F.normalize(self.text_proj(evidence_text), dim=-1)
+        mechanism_vec = F.normalize(self.text_proj(mechanism_text), dim=-1)
+        contrast_vec = F.normalize(self.text_proj(contrast_text), dim=-1)
+
+        # Build sequence with text token
+        cls = self.cls.expand(signal_tokens.shape[0], -1, -1)
+        seq = torch.cat([cls, signal_tokens, combined_vec], dim=1)
+        seq = self.encoder(seq)
+        seq = self.norm(seq)
+        pooled_seq = self.pool(seq, text_index=seq.shape[1] - 1)
+        logits = self.head(pooled_seq)
+
+        # Compute alignment losses
+        align_loss = info_nce(pooled, combined_vec.squeeze(1), temperature=self.temperature)
+
+        if self.multiview_alignment:
+            # Multi-view alignment
+            evidence_align = info_nce(pooled, evidence_vec, temperature=self.temperature)
+            mechanism_align = info_nce(pooled, mechanism_vec, temperature=self.temperature)
+            # Contrast rejection
+            contrast_sim = (pooled @ contrast_vec.t()) / self.temperature
+            contrast_loss = F.cross_entropy(contrast_sim, torch.arange(contrast_sim.shape[0], device=contrast_sim.device))
+            align_loss = align_loss + 0.5 * evidence_align + 0.5 * mechanism_align - 0.3 * contrast_loss
+
+        # Fault-aware gate
+        fault_gates = None
+        fault_gate_logits = None
+        if self.fault_gate is not None:
+            fault_gates, fault_gate_logits = self.fault_gate(
+                modality_embeddings, pooled, evidence_vec, mechanism_vec
+            )
+
+        return StageOutputs(
+            logits=logits,
+            align_loss=align_loss,
+            quality_loss=quality_loss,
+            quality_gates=quality_gates,
+            branch_energies=branch_energies,
+            modality_embeddings=modality_embeddings,
+            modality_names=("position", "electrical", "thermal", "vibration"),
+            fault_gates=fault_gates,
+            fault_gate_logits=fault_gate_logits,
         )

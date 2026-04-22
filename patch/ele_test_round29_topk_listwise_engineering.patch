@@ -1,0 +1,951 @@
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/modality_evidence_topk_v3.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/modality_evidence_topk_v3.py
+new file mode 100644
+index 0000000..6bf9551
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/modality_evidence_topk_v3.py
+@@ -0,0 +1,168 @@
++
++from __future__ import annotations
++
++import json
++import math
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Iterable
++
++BRANCH_NAMES = ["position", "electrical", "thermal", "vibration"]
++BRANCH_TO_INDEX = {name: idx for idx, name in enumerate(BRANCH_NAMES)}
++
++PRIMARY_MODALITY_BY_SCENARIO: dict[str, str] = {
++    "normal": "balanced",
++    "load_disturbance_mild": "position",
++    "load_disturbance_severe": "position",
++    "friction_wear_mild": "position",
++    "friction_wear_severe": "position",
++    "jam_fault": "position",
++    "intermittent_jam_fault": "position",
++    "current_sensor_bias": "electrical",
++    "speed_sensor_scale": "position",
++    "position_sensor_bias": "position",
++    "winding_resistance_rise": "electrical",
++    "bus_voltage_sag_fault": "electrical",
++    "backlash_growth": "position",
++    "thermal_saturation": "thermal",
++    "motor_encoder_freeze": "position",
++    "partial_demagnetization": "electrical",
++    "inverter_voltage_loss": "electrical",
++    "bearing_defect": "vibration",
++}
++
++SUPPORT_MODALITIES_BY_SCENARIO: dict[str, list[str]] = {
++    "normal": BRANCH_NAMES,
++    "load_disturbance_mild": ["electrical"],
++    "load_disturbance_severe": ["electrical"],
++    "friction_wear_mild": ["electrical"],
++    "friction_wear_severe": ["electrical", "vibration"],
++    "jam_fault": ["electrical"],
++    "intermittent_jam_fault": ["electrical", "vibration"],
++    "current_sensor_bias": ["position"],
++    "speed_sensor_scale": ["electrical"],
++    "position_sensor_bias": ["electrical"],
++    "winding_resistance_rise": ["thermal"],
++    "bus_voltage_sag_fault": ["position"],
++    "backlash_growth": ["vibration", "electrical"],
++    "thermal_saturation": ["electrical"],
++    "motor_encoder_freeze": ["electrical"],
++    "partial_demagnetization": ["thermal", "position"],
++    "inverter_voltage_loss": ["position"],
++    "bearing_defect": ["electrical"],
++}
++
++CONFUSION_AWARE_HARD_NEGATIVES: dict[str, list[str]] = {
++    "friction_wear_mild": ["friction_wear_severe", "backlash_growth", "load_disturbance_mild"],
++    "friction_wear_severe": ["friction_wear_mild", "jam_fault", "backlash_growth"],
++    "current_sensor_bias": ["winding_resistance_rise", "bus_voltage_sag_fault", "position_sensor_bias"],
++    "partial_demagnetization": ["inverter_voltage_loss", "winding_resistance_rise"],
++    "bearing_defect": ["backlash_growth", "friction_wear_severe"],
++    "bus_voltage_sag_fault": ["inverter_voltage_loss", "partial_demagnetization"],
++}
++
++def normalize_scenario_name(name: str) -> str:
++    return str(name).strip().lower().replace(" ", "_")
++
++def primary_index_for_scenario(name: str) -> int | None:
++    key = normalize_scenario_name(name)
++    primary = PRIMARY_MODALITY_BY_SCENARIO.get(key)
++    if primary is None or primary == "balanced":
++        return None
++    return BRANCH_TO_INDEX[primary]
++
++def support_indices_for_scenario(name: str) -> list[int]:
++    key = normalize_scenario_name(name)
++    return [BRANCH_TO_INDEX[m] for m in SUPPORT_MODALITIES_BY_SCENARIO.get(key, []) if m in BRANCH_TO_INDEX]
++
++def target_distribution_for_scenario(
++    name: str,
++    *,
++    evidence_primary_weight: float = 0.75,
++    mechanism_primary_weight: float = 0.55,
++    view: str = "evidence",
++) -> list[float]:
++    key = normalize_scenario_name(name)
++    if key == "normal":
++        return [1.0 / len(BRANCH_NAMES)] * len(BRANCH_NAMES)
++    primary = primary_index_for_scenario(key)
++    supports = [idx for idx in support_indices_for_scenario(key) if idx != primary]
++    if primary is None:
++        return [1.0 / len(BRANCH_NAMES)] * len(BRANCH_NAMES)
++    primary_weight = evidence_primary_weight if view == "evidence" else mechanism_primary_weight
++    primary_weight = float(max(0.05, min(primary_weight, 0.95)))
++    remaining = 1.0 - primary_weight
++    q = [0.0] * len(BRANCH_NAMES)
++    q[primary] = primary_weight
++    if supports:
++        w = remaining / len(supports)
++        for idx in supports:
++            q[idx] = w
++    else:
++        q[primary] = 1.0
++    return q
++
++def primary_support_targets_for_scenario(name: str) -> tuple[int | None, list[int]]:
++    return primary_index_for_scenario(name), support_indices_for_scenario(name)
++
++@dataclass
++class TopKDecision:
++    top1: str
++    top2: list[str]
++    top3: list[str]
++    primary_in_top2: bool
++    primary_in_top3: bool
++    primary_or_support_at2: bool
++    primary_or_support_at3: bool
++    weighted_consistency_at3: float
++
++def evaluate_topk_consistency(
++    scenario: str,
++    sorted_modalities: list[str],
++    *,
++    rank_weights: tuple[float, float, float] = (1.0, 0.65, 0.40),
++) -> TopKDecision:
++    key = normalize_scenario_name(scenario)
++    primary = PRIMARY_MODALITY_BY_SCENARIO.get(key, "balanced")
++    supports = set(SUPPORT_MODALITIES_BY_SCENARIO.get(key, []))
++    top2 = list(sorted_modalities[:2])
++    top3 = list(sorted_modalities[:3])
++    if key == "normal":
++        primary_in_top2 = False
++        primary_in_top3 = False
++        ps2 = False
++        ps3 = False
++        weighted = 0.0
++    else:
++        primary_in_top2 = primary in top2
++        primary_in_top3 = primary in top3
++        ps2 = any(item == primary or item in supports for item in top2)
++        ps3 = any(item == primary or item in supports for item in top3)
++        weighted = 0.0
++        for rank, name in enumerate(top3):
++            if name == primary:
++                weighted += rank_weights[rank]
++            elif name in supports:
++                weighted += 0.6 * rank_weights[rank]
++        weighted = min(weighted, 1.0)
++    return TopKDecision(
++        top1=sorted_modalities[0],
++        top2=top2,
++        top3=top3,
++        primary_in_top2=primary_in_top2,
++        primary_in_top3=primary_in_top3,
++        primary_or_support_at2=ps2,
++        primary_or_support_at3=ps3,
++        weighted_consistency_at3=weighted,
++    )
++
++def entropy_from_probs(probs: Iterable[float]) -> float:
++    values = [max(float(x), 1.0e-12) for x in probs]
++    total = sum(values)
++    if total <= 0.0:
++        return 0.0
++    values = [x / total for x in values]
++    return -sum(v * math.log(v + 1.0e-12) for v in values)
++
++def write_json(path: Path, payload: dict) -> None:
++    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_topk_listwise_token_alignment_v1.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_topk_listwise_token_alignment_v1.py
+new file mode 100644
+index 0000000..b440916
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_topk_listwise_token_alignment_v1.py
+@@ -0,0 +1,702 @@
++
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import math
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from torch import Tensor
++from torch.utils.data import DataLoader
++
++PROJECT_ROOT = Path(__file__).resolve().parent.parent
++if str(PROJECT_ROOT) not in sys.path:
++    sys.path.insert(0, str(PROJECT_ROOT))
++
++from servo_llm_alignment.dataset import load_alignment_records
++from servo_llm_alignment.text_encoder import MockFrozenTextEncoder, QwenFrozenTextEncoder
++
++from experiments_smoke_20260316.exp1_decoupled_models import (
++    Stage3DecoupledClassifier,
++    Stage4DecoupledClassifier,
++    info_nce,
++)
++from experiments_smoke_20260316.train_exp1_decoupled_stages import (
++    DecoupledDataset,
++    StageTextDataset,
++    apply_feature_mode,
++    apply_normalization,
++    batch_input_dims,
++    collate_with_records,
++    compute_normalization_stats,
++    load_decoupled_arrays,
++    load_init,
++    move_batch_to_device,
++    stratified_split_three_way,
++)
++from experiments_smoke_20260316.modality_evidence_topk_v3 import (
++    BRANCH_NAMES,
++    BRANCH_TO_INDEX,
++    CONFUSION_AWARE_HARD_NEGATIVES,
++    PRIMARY_MODALITY_BY_SCENARIO,
++    SUPPORT_MODALITIES_BY_SCENARIO,
++    entropy_from_probs,
++    evaluate_topk_consistency,
++    normalize_scenario_name,
++    primary_index_for_scenario,
++    support_indices_for_scenario,
++    target_distribution_for_scenario,
++    write_json,
++)
++
++TOKEN_COUNTS = {
++    "position": 20,
++    "electrical": 24,
++    "thermal": 8,
++    "vibration": 16,
++}
++
++def _token_slices() -> dict[str, slice]:
++    start = 0
++    out: dict[str, slice] = {}
++    for key in ["position", "electrical", "thermal", "vibration"]:
++        count = TOKEN_COUNTS[key]
++        out[key] = slice(start, start + count)
++        start += count
++    return out
++
++TOKEN_SLICES = _token_slices()
++
++@dataclass
++class ViewBatch:
++    combined: Tensor
++    evidence: Tensor
++    mechanism: Tensor
++    contrast: Tensor
++
++class PrototypeBank:
++    def __init__(self, num_classes: int, dim: int, ema: float, device: torch.device) -> None:
++        self.ema = float(ema)
++        self.combined = F.normalize(torch.zeros(num_classes, dim, device=device), dim=-1)
++        self.evidence = F.normalize(torch.zeros(num_classes, dim, device=device), dim=-1)
++        self.mechanism = F.normalize(torch.zeros(num_classes, dim, device=device), dim=-1)
++        self.initialized = torch.zeros(num_classes, dtype=torch.bool, device=device)
++
++    def update(self, labels: Tensor, views: ViewBatch) -> None:
++        with torch.no_grad():
++            for cls in labels.unique().tolist():
++                mask = labels == int(cls)
++                if not mask.any():
++                    continue
++                for name in ["combined", "evidence", "mechanism"]:
++                    current = getattr(views, name)[mask].mean(dim=0)
++                    bank = getattr(self, name)
++                    current = F.normalize(current, dim=-1)
++                    if self.initialized[int(cls)]:
++                        bank[int(cls)] = F.normalize(self.ema * bank[int(cls)] + (1.0 - self.ema) * current, dim=-1)
++                    else:
++                        bank[int(cls)] = current
++                self.initialized[int(cls)] = True
++
++    def positive_loss(self, labels: Tensor, views: ViewBatch) -> Tensor:
++        loss = 0.0
++        count = 0
++        for name in ["combined", "evidence", "mechanism"]:
++            bank = getattr(self, name)
++            valid = self.initialized[labels]
++            if valid.any():
++                sim = F.cosine_similarity(getattr(views, name)[valid], bank[labels[valid]], dim=-1)
++                loss = loss + (1.0 - sim).mean()
++                count += 1
++        if count == 0:
++            return labels.new_zeros((), dtype=torch.float32)
++        return loss / float(count)
++
++    def hard_negative_loss(self, labels: Tensor, views: ViewBatch, class_names: list[str], margin: float = 0.15) -> Tensor:
++        losses: list[Tensor] = []
++        evidence_bank = self.evidence
++        for i in range(labels.shape[0]):
++            cls_idx = int(labels[i].item())
++            cls_name = normalize_scenario_name(class_names[cls_idx])
++            neg_names = CONFUSION_AWARE_HARD_NEGATIVES.get(cls_name, [])
++            if not neg_names or not self.initialized[cls_idx]:
++                continue
++            neg_indices = [class_names.index(name) for name in neg_names if name in class_names and self.initialized[class_names.index(name)]]
++            if not neg_indices:
++                continue
++            pos_sim = F.cosine_similarity(views.evidence[i].unsqueeze(0), evidence_bank[cls_idx].unsqueeze(0), dim=-1).squeeze(0)
++            neg_sims = F.cosine_similarity(
++                views.evidence[i].unsqueeze(0).expand(len(neg_indices), -1),
++                evidence_bank[neg_indices],
++                dim=-1,
++            )
++            losses.append(F.relu(margin - pos_sim + neg_sims.max()))
++        if not losses:
++            return labels.new_zeros((), dtype=torch.float32)
++        return torch.stack(losses).mean()
++
++def build_text_encoder(text_backbone: str, qwen_path: Path, device: torch.device):
++    if text_backbone == "qwen":
++        encoder = QwenFrozenTextEncoder(str(qwen_path), device=device)
++        dim = int(encoder.hidden_size)
++    else:
++        encoder = MockFrozenTextEncoder(hidden_size=768)
++        dim = int(encoder.hidden_size)
++    return encoder, dim
++
++def _texts_for_record(record) -> dict[str, str]:
++    texts = getattr(record, "texts", {}) or {}
++    combined = texts.get("combined_text", "") or getattr(record, "text", "")
++    evidence = texts.get("evidence_text", "") or combined
++    mechanism = texts.get("mechanism_text", "") or combined
++    contrast = texts.get("contrast_text", "") or combined
++    return {
++        "combined": str(combined),
++        "evidence": str(evidence),
++        "mechanism": str(mechanism),
++        "contrast": str(contrast),
++    }
++
++def build_view_caches(
++    output_dir: Path,
++    records: list,
++    text_backbone: str,
++    qwen_path: Path,
++    device: torch.device,
++    text_batch_size: int,
++) -> tuple[dict[str, Tensor], int]:
++    encoder, text_dim = build_text_encoder(text_backbone, qwen_path, device)
++    caches: dict[str, Tensor] = {}
++    output_dir.mkdir(parents=True, exist_ok=True)
++    for view in ["combined", "evidence", "mechanism", "contrast"]:
++        cache_path = output_dir / f"text_embeddings__{view}__{text_backbone}.pt"
++        if cache_path.exists():
++            caches[view] = torch.load(cache_path, map_location="cpu", weights_only=False)
++            continue
++        texts = [_texts_for_record(r)[view] for r in records]
++        embeddings = encoder.encode_texts(texts, batch_size=text_batch_size)
++        torch.save(embeddings, cache_path)
++        caches[view] = embeddings
++    return caches, text_dim
++
++def split_modality_vectors(tokens: Tensor) -> dict[str, Tensor]:
++    return {
++        name: F.normalize(tokens[:, slc, :].mean(dim=1), dim=-1)
++        for name, slc in TOKEN_SLICES.items()
++    }
++
++def stack_modality_vectors(vectors: dict[str, Tensor]) -> Tensor:
++    return torch.stack([vectors[name] for name in BRANCH_NAMES], dim=1)
++
++def _target_distribution_tensor(names: list[str], view: str, device: torch.device) -> Tensor:
++    rows = [target_distribution_for_scenario(name, view=view) for name in names]
++    return torch.tensor(rows, dtype=torch.float32, device=device)
++
++def listwise_alignment_loss(sim: Tensor, target_dist: Tensor, temperature: float = 0.25) -> Tensor:
++    log_probs = F.log_softmax(sim / temperature, dim=-1)
++    return -(target_dist * log_probs).sum(dim=-1).mean()
++
++def ranking_margin_loss(sim: Tensor, scenario_names: list[str], margin_primary: float = 0.15, margin_support: float = 0.05) -> Tensor:
++    losses: list[Tensor] = []
++    for i, scenario in enumerate(scenario_names):
++        primary = primary_index_for_scenario(scenario)
++        supports = support_indices_for_scenario(scenario)
++        if primary is None:
++            continue
++        primary_val = sim[i, primary]
++        other_indices = [idx for idx in range(sim.shape[1]) if idx != primary]
++        if other_indices:
++            losses.append(F.relu(margin_primary - primary_val + sim[i, other_indices]).mean())
++        support_only = [idx for idx in supports if idx != primary]
++        non_support = [idx for idx in range(sim.shape[1]) if idx not in support_only and idx != primary]
++        if support_only and non_support:
++            support_val = sim[i, support_only].mean()
++            losses.append(F.relu(margin_support - support_val + sim[i, non_support]).mean())
++    if not losses:
++        return sim.new_zeros(())
++    return torch.stack(losses).mean()
++
++def sinkhorn_plan(cost: Tensor, iters: int = 8, epsilon: float = 0.15) -> Tensor:
++    # cost: [B, M, V]
++    log_k = -cost / epsilon
++    u = torch.zeros(cost.shape[0], cost.shape[1], device=cost.device, dtype=cost.dtype)
++    v = torch.zeros(cost.shape[0], cost.shape[2], device=cost.device, dtype=cost.dtype)
++    log_mu = torch.full_like(u, -math.log(cost.shape[1]))
++    log_nu = torch.full_like(v, -math.log(cost.shape[2]))
++    for _ in range(iters):
++        u = log_mu - torch.logsumexp(log_k + v.unsqueeze(1), dim=2)
++        v = log_nu - torch.logsumexp(log_k + u.unsqueeze(2), dim=1)
++    return torch.exp(log_k + u.unsqueeze(2) + v.unsqueeze(1))
++
++def transport_alignment_loss(modality_stack: Tensor, views: ViewBatch, scenario_names: list[str]) -> Tensor:
++    view_stack = torch.stack([views.evidence, views.mechanism, views.contrast], dim=1)
++    modality_norm = F.normalize(modality_stack, dim=-1)
++    view_norm = F.normalize(view_stack, dim=-1)
++    sim = torch.einsum("bmd,bvd->bmv", modality_norm, view_norm)
++    cost = 1.0 - sim
++    plan = sinkhorn_plan(cost)
++    target = []
++    for scenario in scenario_names:
++        ev = target_distribution_for_scenario(scenario, view="evidence")
++        mech = target_distribution_for_scenario(scenario, view="mechanism")
++        if normalize_scenario_name(scenario) == "normal":
++            ctr = [0.25] * 4
++        else:
++            ctr = [1.0 / 4.0] * 4
++        mat = torch.tensor(np.stack([ev, mech, ctr], axis=1), dtype=modality_stack.dtype, device=modality_stack.device)
++        mat = mat / mat.sum()
++        target.append(mat)
++    target_plan = torch.stack(target, dim=0)
++    return F.kl_div(torch.log(plan.clamp_min(1.0e-6)), target_plan, reduction="batchmean")
++
++def _prepare_view_batch(records, view_caches: dict[str, Tensor], device: torch.device) -> tuple[ViewBatch, list[str], Tensor]:
++    idx = torch.as_tensor([int(r.index) for r in records], dtype=torch.long)
++    names = [normalize_scenario_name(str(getattr(r, "scenario", ""))) for r in records]
++    return (
++        ViewBatch(
++            combined=view_caches["combined"][idx].to(device),
++            evidence=view_caches["evidence"][idx].to(device),
++            mechanism=view_caches["mechanism"][idx].to(device),
++            contrast=view_caches["contrast"][idx].to(device),
++        ),
++        names,
++        idx,
++    )
++
++def _build_stage_model(args, input_dims, num_classes, text_dim, device):
++    if int(args.stage) == 3:
++        return Stage3DecoupledClassifier(
++            input_dims=input_dims,
++            num_classes=num_classes,
++            text_dim=text_dim,
++            model_dim=int(args.model_dim),
++            token_dim=int(args.token_dim),
++            quality_aware_fusion=bool(args.quality_aware_fusion),
++            quality_hidden_dim=int(args.quality_hidden_dim),
++            modality_drop_prob=float(args.quality_drop_prob),
++            quality_min_gate=float(args.quality_min_gate),
++        ).to(device)
++    return Stage4DecoupledClassifier(
++        input_dims=input_dims,
++        num_classes=num_classes,
++        text_dim=text_dim,
++        model_dim=int(args.model_dim),
++        token_dim=int(args.token_dim),
++        num_layers=int(args.llm_layers),
++        nhead=int(args.llm_heads),
++        dim_feedforward=int(args.llm_ff),
++        pool=str(args.pool),
++        quality_aware_fusion=bool(args.quality_aware_fusion),
++        quality_hidden_dim=int(args.quality_hidden_dim),
++        modality_drop_prob=float(args.quality_drop_prob),
++        quality_min_gate=float(args.quality_min_gate),
++    ).to(device)
++
++def forward_stage(model, stage: int, batch, view_batch: ViewBatch) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, dict[str, Tensor]]:
++    if stage == 3:
++        tokens, pooled, quality_loss, quality_gates, branch_energies = model.backbone(batch)
++        logits = model.head(pooled)
++    else:
++        tokens, pooled, quality_loss, quality_gates, branch_energies = model.backbone(batch)
++        projected = {
++            "combined": F.normalize(model.text_proj(view_batch.combined), dim=-1),
++            "evidence": F.normalize(model.text_proj(view_batch.evidence), dim=-1),
++            "mechanism": F.normalize(model.text_proj(view_batch.mechanism), dim=-1),
++            "contrast": F.normalize(model.text_proj(view_batch.contrast), dim=-1),
++        }
++        text_tokens = [projected["combined"].unsqueeze(1), projected["evidence"].unsqueeze(1), projected["mechanism"].unsqueeze(1), projected["contrast"].unsqueeze(1)]
++        cls = model.cls.expand(tokens.shape[0], -1, -1)
++        seq = torch.cat([cls, tokens] + text_tokens, dim=1)
++        seq = model.encoder(seq)
++        seq = model.norm(seq)
++        pooled_seq = model.pool(seq) if model.pool.mode != "text" else model.pool(seq, text_index=1 + tokens.shape[1])
++        logits = model.head(pooled_seq)
++    projected = {
++        "combined": F.normalize(model.text_proj(view_batch.combined), dim=-1),
++        "evidence": F.normalize(model.text_proj(view_batch.evidence), dim=-1),
++        "mechanism": F.normalize(model.text_proj(view_batch.mechanism), dim=-1),
++        "contrast": F.normalize(model.text_proj(view_batch.contrast), dim=-1),
++    }
++    return logits, pooled, quality_loss, quality_gates, branch_energies, projected
++
++def compute_total_loss(
++    *,
++    logits: Tensor,
++    y_cls: Tensor,
++    pooled: Tensor,
++    modality_vecs: dict[str, Tensor],
++    projected: dict[str, Tensor],
++    quality_loss: Tensor | None,
++    scenario_names: list[str],
++    class_names: list[str],
++    prototype_bank: PrototypeBank,
++    args,
++) -> tuple[Tensor, dict[str, float], dict[str, Tensor]]:
++    ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=float(args.label_smoothing))
++    align_combined = info_nce(pooled, projected["combined"], temperature=float(args.temperature))
++    align_evidence = info_nce(pooled, projected["evidence"], temperature=float(args.temperature))
++    align_mechanism = info_nce(pooled, projected["mechanism"], temperature=float(args.temperature))
++    contrast_sim = F.cosine_similarity(pooled, projected["contrast"], dim=-1).mean()
++
++    modality_stack = stack_modality_vectors(modality_vecs)
++    evidence_sim = torch.einsum("bmd,bd->bm", modality_stack, projected["evidence"])
++    mechanism_sim = torch.einsum("bmd,bd->bm", modality_stack, projected["mechanism"])
++
++    evidence_target = _target_distribution_tensor(scenario_names, "evidence", pooled.device)
++    mechanism_target = _target_distribution_tensor(scenario_names, "mechanism", pooled.device)
++    listwise = 0.5 * (
++        listwise_alignment_loss(evidence_sim, evidence_target, temperature=float(args.listwise_temperature))
++        + listwise_alignment_loss(mechanism_sim, mechanism_target, temperature=float(args.listwise_temperature))
++    )
++    ranking = 0.5 * (
++        ranking_margin_loss(evidence_sim, scenario_names, margin_primary=float(args.margin_primary), margin_support=float(args.margin_support))
++        + ranking_margin_loss(mechanism_sim, scenario_names, margin_primary=float(args.margin_primary), margin_support=float(args.margin_support))
++    )
++    proto_loss = prototype_bank.positive_loss(y_cls, ViewBatch(projected["combined"], projected["evidence"], projected["mechanism"], projected["contrast"]))
++    hard_neg_loss = prototype_bank.hard_negative_loss(
++        y_cls,
++        ViewBatch(projected["combined"], projected["evidence"], projected["mechanism"], projected["contrast"]),
++        class_names,
++        margin=float(args.hard_negative_margin),
++    )
++    transport_loss = transport_alignment_loss(modality_stack, ViewBatch(projected["combined"], projected["evidence"], projected["mechanism"], projected["contrast"]), scenario_names)
++
++    total = ce_loss
++    total = total + float(args.lambda_align_combined) * align_combined
++    total = total + float(args.lambda_align_evidence) * align_evidence
++    total = total + float(args.lambda_align_mechanism) * align_mechanism
++    total = total - float(args.lambda_contrast) * contrast_sim
++    total = total + float(args.lambda_listwise) * listwise
++    total = total + float(args.lambda_ranking) * ranking
++    total = total + float(args.lambda_prototype) * proto_loss
++    total = total + float(args.lambda_hard_negative) * hard_neg_loss
++    total = total + float(args.lambda_transport) * transport_loss
++    if quality_loss is not None:
++        total = total + float(args.lambda_quality) * quality_loss
++    scalars = {
++        "ce_loss": float(ce_loss.item()),
++        "align_combined": float(align_combined.item()),
++        "align_evidence": float(align_evidence.item()),
++        "align_mechanism": float(align_mechanism.item()),
++        "contrast_sim": float(contrast_sim.item()),
++        "listwise_loss": float(listwise.item()),
++        "ranking_loss": float(ranking.item()),
++        "prototype_loss": float(proto_loss.item()),
++        "hard_negative_loss": float(hard_neg_loss.item()),
++        "transport_loss": float(transport_loss.item()),
++        "quality_loss": float(quality_loss.item()) if quality_loss is not None else 0.0,
++    }
++    sims = {"evidence": evidence_sim.detach(), "mechanism": mechanism_sim.detach()}
++    return total, scalars, sims
++
++def _row_metrics(scores: list[float], scenario: str) -> dict[str, Any]:
++    pairs = sorted(zip(BRANCH_NAMES, scores), key=lambda x: x[1], reverse=True)
++    ranking = [name for name, _ in pairs]
++    topk = evaluate_topk_consistency(scenario, ranking)
++    probs = F.softmax(torch.tensor(scores, dtype=torch.float32), dim=0).tolist()
++    return {
++        "top1": topk.top1,
++        "top2": topk.top2,
++        "top3": topk.top3,
++        "primary_in_top2": int(topk.primary_in_top2),
++        "primary_in_top3": int(topk.primary_in_top3),
++        "primary_or_support_at2": int(topk.primary_or_support_at2),
++        "primary_or_support_at3": int(topk.primary_or_support_at3),
++        "weighted_consistency_at3": float(topk.weighted_consistency_at3),
++        "entropy": float(entropy_from_probs(probs)),
++        "ranking": ranking,
++    }
++
++def evaluate_and_export(
++    model,
++    loader,
++    device: torch.device,
++    view_caches: dict[str, Tensor],
++    class_names: list[str],
++    prototype_bank: PrototypeBank,
++    args,
++    output_dir: Path,
++) -> dict[str, Any]:
++    model.eval()
++    total = 0
++    correct = 0
++    rows: list[dict[str, Any]] = []
++    scalar_sums: dict[str, float] = {}
++    with torch.no_grad():
++        for batch, records in loader:
++            batch = move_batch_to_device(batch, device)
++            view_batch, scenario_names, sample_idx = _prepare_view_batch(records, view_caches, device)
++            logits, pooled, quality_loss, _quality_gates, _branch_energies, projected = forward_stage(model, int(args.stage), batch, view_batch)
++            modality_vecs = split_modality_vectors(model.backbone(batch)[0] if False else model.backbone(batch)[0])  # placeholder unreachable
++            tokens, pooled2, quality_loss2, quality_gates2, branch_energies2 = model.backbone(batch)
++            modality_vecs = split_modality_vectors(tokens)
++            loss, scalars, sims = compute_total_loss(
++                logits=logits,
++                y_cls=batch.y_cls,
++                pooled=pooled,
++                modality_vecs=modality_vecs,
++                projected=projected,
++                quality_loss=quality_loss,
++                scenario_names=scenario_names,
++                class_names=class_names,
++                prototype_bank=prototype_bank,
++                args=args,
++            )
++            preds = logits.argmax(dim=1)
++            correct += int((preds == batch.y_cls).sum().item())
++            total += int(batch.y_cls.numel())
++            for k, v in scalars.items():
++                scalar_sums[k] = scalar_sums.get(k, 0.0) + float(v) * int(batch.y_cls.numel())
++            for i in range(batch.y_cls.shape[0]):
++                row = {
++                    "sample_index": int(sample_idx[i].item()),
++                    "true_class": int(batch.y_cls[i].item()),
++                    "pred_class": int(preds[i].item()),
++                    "scenario": scenario_names[i],
++                }
++                for view_name in ["evidence", "mechanism"]:
++                    scores = sims[view_name][i].cpu().tolist()
++                    metrics = _row_metrics(scores, scenario_names[i])
++                    for j, branch_name in enumerate(BRANCH_NAMES):
++                        row[f"{view_name}_score_{branch_name}"] = float(scores[j])
++                    row[f"{view_name}_top1"] = metrics["top1"]
++                    row[f"{view_name}_top2"] = "|".join(metrics["top2"])
++                    row[f"{view_name}_top3"] = "|".join(metrics["top3"])
++                    row[f"{view_name}_primary_in_top2"] = metrics["primary_in_top2"]
++                    row[f"{view_name}_primary_in_top3"] = metrics["primary_in_top3"]
++                    row[f"{view_name}_primary_or_support_at2"] = metrics["primary_or_support_at2"]
++                    row[f"{view_name}_primary_or_support_at3"] = metrics["primary_or_support_at3"]
++                    row[f"{view_name}_weighted_consistency_at3"] = metrics["weighted_consistency_at3"]
++                    row[f"{view_name}_entropy"] = metrics["entropy"]
++                rows.append(row)
++
++    csv_path = output_dir / "test_modality_evidence_scores.csv"
++    if rows:
++        fieldnames = list(rows[0].keys())
++        with csv_path.open("w", encoding="utf-8", newline="") as f:
++            writer = csv.DictWriter(f, fieldnames=fieldnames)
++            writer.writeheader()
++            writer.writerows(rows)
++
++    summary = build_summary(rows, class_names)
++    summary["test_accuracy"] = correct / max(1, total)
++    summary["loss_terms"] = {k: v / max(1, total) for k, v in scalar_sums.items()}
++    write_json(output_dir / "test_modality_evidence_summary.json", summary)
++    return {
++        "scenario_accuracy": correct / max(1, total),
++        "rows": rows,
++        "summary": summary,
++        "loss_terms": {k: v / max(1, total) for k, v in scalar_sums.items()},
++    }
++
++def build_summary(rows: list[dict[str, Any]], class_names: list[str]) -> dict[str, Any]:
++    def mean(values: list[float]) -> float:
++        return float(sum(values) / len(values)) if values else float("nan")
++
++    views = ["evidence", "mechanism"]
++    summary: dict[str, Any] = {"per_class": {}}
++    overall_fault_rows = [r for r in rows if r["scenario"] != "normal"]
++    for view in views:
++        summary[view] = {
++            "primary_in_top2": mean([r[f"{view}_primary_in_top2"] for r in rows]),
++            "primary_in_top3": mean([r[f"{view}_primary_in_top3"] for r in rows]),
++            "primary_or_support_at2": mean([r[f"{view}_primary_or_support_at2"] for r in rows]),
++            "primary_or_support_at3": mean([r[f"{view}_primary_or_support_at3"] for r in rows]),
++            "weighted_consistency_at3": mean([r[f"{view}_weighted_consistency_at3"] for r in rows]),
++            "fault_only": {
++                "primary_in_top2": mean([r[f"{view}_primary_in_top2"] for r in overall_fault_rows]),
++                "primary_in_top3": mean([r[f"{view}_primary_in_top3"] for r in overall_fault_rows]),
++                "primary_or_support_at2": mean([r[f"{view}_primary_or_support_at2"] for r in overall_fault_rows]),
++                "primary_or_support_at3": mean([r[f"{view}_primary_or_support_at3"] for r in overall_fault_rows]),
++                "weighted_consistency_at3": mean([r[f"{view}_weighted_consistency_at3"] for r in overall_fault_rows]),
++            },
++        }
++    summary["normal"] = {
++        "count": sum(1 for r in rows if r["scenario"] == "normal"),
++        "evidence_entropy": mean([r["evidence_entropy"] for r in rows if r["scenario"] == "normal"]),
++        "mechanism_entropy": mean([r["mechanism_entropy"] for r in rows if r["scenario"] == "normal"]),
++    }
++    for cls_name in sorted(set(r["scenario"] for r in rows)):
++        class_rows = [r for r in rows if r["scenario"] == cls_name]
++        summary["per_class"][cls_name] = {
++            "count": len(class_rows),
++            "evidence_primary_in_top2": mean([r["evidence_primary_in_top2"] for r in class_rows]),
++            "evidence_primary_in_top3": mean([r["evidence_primary_in_top3"] for r in class_rows]),
++            "evidence_primary_or_support_at3": mean([r["evidence_primary_or_support_at3"] for r in class_rows]),
++            "evidence_weighted_consistency_at3": mean([r["evidence_weighted_consistency_at3"] for r in class_rows]),
++            "mechanism_primary_in_top2": mean([r["mechanism_primary_in_top2"] for r in class_rows]),
++            "mechanism_primary_in_top3": mean([r["mechanism_primary_in_top3"] for r in class_rows]),
++            "mechanism_primary_or_support_at3": mean([r["mechanism_primary_or_support_at3"] for r in class_rows]),
++            "mechanism_weighted_consistency_at3": mean([r["mechanism_weighted_consistency_at3"] for r in class_rows]),
++        }
++    return summary
++
++def train_epoch(
++    model,
++    loader,
++    optimizer,
++    device: torch.device,
++    view_caches: dict[str, Tensor],
++    class_names: list[str],
++    prototype_bank: PrototypeBank,
++    args,
++) -> dict[str, float]:
++    model.train()
++    total = 0
++    correct = 0
++    accum: dict[str, float] = {}
++    for batch, records in loader:
++        batch = move_batch_to_device(batch, device)
++        view_batch, scenario_names, _sample_idx = _prepare_view_batch(records, view_caches, device)
++        logits, pooled, quality_loss, _quality_gates, _branch_energies, projected = forward_stage(model, int(args.stage), batch, view_batch)
++        tokens, _pooled2, _quality_loss2, _quality_gates2, _branch_energies2 = model.backbone(batch)
++        modality_vecs = split_modality_vectors(tokens)
++        loss, scalars, _sims = compute_total_loss(
++            logits=logits,
++            y_cls=batch.y_cls,
++            pooled=pooled,
++            modality_vecs=modality_vecs,
++            projected=projected,
++            quality_loss=quality_loss,
++            scenario_names=scenario_names,
++            class_names=class_names,
++            prototype_bank=prototype_bank,
++            args=args,
++        )
++        optimizer.zero_grad()
++        loss.backward()
++        optimizer.step()
++        prototype_bank.update(batch.y_cls, ViewBatch(projected["combined"].detach(), projected["evidence"].detach(), projected["mechanism"].detach(), projected["contrast"].detach()))
++        preds = logits.argmax(dim=1)
++        correct += int((preds == batch.y_cls).sum().item())
++        total += int(batch.y_cls.numel())
++        for k, v in scalars.items():
++            accum[k] = accum.get(k, 0.0) + float(v) * int(batch.y_cls.numel())
++    accum["scenario_accuracy"] = correct / max(1, total)
++    for k in list(accum.keys()):
++        if k != "scenario_accuracy":
++            accum[k] = accum[k] / max(1, total)
++    return accum
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--stage", type=int, choices=[3, 4], required=True)
++    parser.add_argument("--dataset", type=Path, required=True)
++    parser.add_argument("--corpus", type=Path, required=True)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    parser.add_argument("--init", type=Path, default=None)
++    parser.add_argument("--device", type=str, default="cuda")
++    parser.add_argument("--epochs", type=int, default=16)
++    parser.add_argument("--batch-size", type=int, default=16)
++    parser.add_argument("--lr", type=float, default=2e-4)
++    parser.add_argument("--weight-decay", type=float, default=1e-4)
++    parser.add_argument("--val-ratio", type=float, default=0.15)
++    parser.add_argument("--test-ratio", type=float, default=0.15)
++    parser.add_argument("--seed", type=int, default=7)
++    parser.add_argument("--label-smoothing", type=float, default=0.03)
++    parser.add_argument("--max-samples", type=int, default=0)
++    parser.add_argument("--model-dim", type=int, default=128)
++    parser.add_argument("--token-dim", type=int, default=256)
++    parser.add_argument("--text-backbone", choices=["qwen", "mock"], default="mock")
++    parser.add_argument("--qwen-path", type=Path, default=Path("/mnt/PRO6000_disk/models/Qwen/Qwen2.5-7B-Instruct"))
++    parser.add_argument("--text-batch-size", type=int, default=8)
++    parser.add_argument("--llm-layers", type=int, default=4)
++    parser.add_argument("--llm-heads", type=int, default=8)
++    parser.add_argument("--llm-ff", type=int, default=768)
++    parser.add_argument("--pool", choices=["cls", "mean", "attn", "text"], default="attn")
++    parser.add_argument("--feature-mode", choices=["base", "modality_tf"], default="modality_tf")
++    parser.add_argument("--feature-chunk-size", type=int, default=2048)
++    parser.add_argument("--quality-aware-fusion", action="store_true")
++    parser.add_argument("--quality-hidden-dim", type=int, default=128)
++    parser.add_argument("--quality-drop-prob", type=float, default=0.10)
++    parser.add_argument("--quality-min-gate", type=float, default=0.10)
++    parser.add_argument("--lambda-quality", type=float, default=0.10)
++    parser.add_argument("--temperature", type=float, default=0.07)
++    parser.add_argument("--lambda-align-combined", type=float, default=0.55)
++    parser.add_argument("--lambda-align-evidence", type=float, default=0.80)
++    parser.add_argument("--lambda-align-mechanism", type=float, default=0.70)
++    parser.add_argument("--lambda-contrast", type=float, default=0.25)
++    parser.add_argument("--lambda-listwise", type=float, default=0.30)
++    parser.add_argument("--lambda-ranking", type=float, default=0.20)
++    parser.add_argument("--lambda-prototype", type=float, default=0.18)
++    parser.add_argument("--lambda-hard-negative", type=float, default=0.12)
++    parser.add_argument("--lambda-transport", type=float, default=0.08)
++    parser.add_argument("--listwise-temperature", type=float, default=0.25)
++    parser.add_argument("--margin-primary", type=float, default=0.15)
++    parser.add_argument("--margin-support", type=float, default=0.05)
++    parser.add_argument("--hard-negative-margin", type=float, default=0.15)
++    parser.add_argument("--prototype-ema", type=float, default=0.95)
++    args = parser.parse_args()
++
++    torch.manual_seed(int(args.seed))
++    np.random.seed(int(args.seed))
++
++    arrays, records = load_decoupled_arrays(args.dataset, args.corpus, int(args.max_samples))
++    arrays, feature_meta = apply_feature_mode(arrays, str(args.feature_mode), chunk_size=int(args.feature_chunk_size))
++    y_cls = arrays["y_cls"].astype(np.int64)
++    train_idx, val_idx, test_idx = stratified_split_three_way(y_cls, float(args.val_ratio), float(args.test_ratio), int(args.seed))
++    stats = compute_normalization_stats(arrays, train_idx)
++    normalized = apply_normalization(arrays, stats)
++    full_indices = np.arange(y_cls.shape[0], dtype=np.int64)
++    base_dataset = DecoupledDataset(normalized, full_indices)
++
++    train_loader = DataLoader(StageTextDataset(base_dataset, records, train_idx), batch_size=args.batch_size, shuffle=True, collate_fn=collate_with_records)
++    val_loader = DataLoader(StageTextDataset(base_dataset, records, val_idx), batch_size=args.batch_size, shuffle=False, collate_fn=collate_with_records)
++    test_loader = DataLoader(StageTextDataset(base_dataset, records, test_idx), batch_size=args.batch_size, shuffle=False, collate_fn=collate_with_records)
++
++    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    view_caches, text_dim = build_view_caches(args.output_dir, records, str(args.text_backbone), args.qwen_path, device, int(args.text_batch_size))
++    input_dims = batch_input_dims(base_dataset[0])
++    class_names = [normalize_scenario_name(str(x)) for x in arrays["class_names"].astype(str).tolist()]
++    model = _build_stage_model(args, input_dims, len(class_names), text_dim, device)
++    if args.init is not None:
++        load_init(model, args.init)
++    prototype_bank = PrototypeBank(len(class_names), int(args.token_dim), float(args.prototype_ema), device)
++    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=float(args.lr), weight_decay=float(args.weight_decay))
++
++    best_val = -math.inf
++    best_path = args.output_dir / "best.pt"
++    history = []
++    for epoch in range(1, int(args.epochs) + 1):
++        train_stats = train_epoch(model, train_loader, optimizer, device, view_caches, class_names, prototype_bank, args)
++        val_eval = evaluate_and_export(model, val_loader, device, view_caches, class_names, prototype_bank, args, args.output_dir / f"_val_epoch_{epoch}")
++        row = {
++            "epoch": epoch,
++            "train_scenario_accuracy": float(train_stats["scenario_accuracy"]),
++            "val_scenario_accuracy": float(val_eval["scenario_accuracy"]),
++        }
++        row.update({f"train_{k}": float(v) for k, v in train_stats.items() if k != "scenario_accuracy"})
++        row.update({f"val_{k}": float(v) for k, v in val_eval["loss_terms"].items()})
++        history.append(row)
++        print(json.dumps(row, ensure_ascii=False))
++        if val_eval["scenario_accuracy"] > best_val:
++            best_val = val_eval["scenario_accuracy"]
++            torch.save({"model": model.state_dict(), "config": vars(args), "feature_mode": feature_meta}, best_path)
++
++    checkpoint = torch.load(best_path, map_location=device, weights_only=False)
++    model.load_state_dict(checkpoint["model"])
++    test_eval = evaluate_and_export(model, test_loader, device, view_caches, class_names, prototype_bank, args, args.output_dir)
++
++    report = {
++        "stage": int(args.stage),
++        "best_checkpoint": str(best_path),
++        "best_val_scenario_accuracy": float(best_val),
++        "test_scenario_accuracy": float(test_eval["scenario_accuracy"]),
++        "feature_mode": feature_meta,
++        "history": history,
++        "loss_terms": test_eval["loss_terms"],
++        "summary_path": str(args.output_dir / "test_modality_evidence_summary.json"),
++        "scores_path": str(args.output_dir / "test_modality_evidence_scores.csv"),
++    }
++    write_json(args.output_dir / "report.json", report)
++
++if __name__ == "__main__":
++    main()
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_topk_listwise_token_alignment_v1.sh b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_topk_listwise_token_alignment_v1.sh
+new file mode 100644
+index 0000000..6706354
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_topk_listwise_token_alignment_v1.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++PYTHON_PATH="${PYTHON_PATH:-python3}"
++DEVICE="${DEVICE:-cuda}"
++CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
++
++PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
++cd "${PROJECT_ROOT}"
++
++export PYTHONUNBUFFERED=1
++export PYTHONPATH=.
++export CUDA_VISIBLE_DEVICES
++
++OUT_ROOT="${OUT_ROOT:-${PROJECT_ROOT}/experiments_smoke_20260316/models/exp1_topk_listwise_token_alignment_v1}"
++DATASET="${DATASET:-${PROJECT_ROOT}/derived_datasets/servo_multimodal_handoff_dataset.npz}"
++CORPUS="${CORPUS:-${PROJECT_ROOT}/derived_datasets/stage1_alignment_corpus.jsonl}"
++TEXT_BACKBONE="${TEXT_BACKBONE:-mock}"
++QWEN_PATH="${QWEN_PATH:-/mnt/PRO6000_disk/models/Qwen/Qwen2.5-7B-Instruct}"
++BATCH_SIZE="${BATCH_SIZE:-16}"
++SEED="${SEED:-7}"
++FEATURE_MODE="${FEATURE_MODE:-modality_tf}"
++
++STAGE3_INIT="${STAGE3_INIT:-${PROJECT_ROOT}/experiments_smoke_20260316/models/exp1_fault_aware_gate_multiview_align_v1/stage2_signal_fusion/best.pt}"
++STAGE3_DIR="${OUT_ROOT}/stage3_topk_listwise"
++STAGE4_DIR="${OUT_ROOT}/stage4_topk_listwise"
++
++mkdir -p "${OUT_ROOT}"
++
++"${PYTHON_PATH}" experiments_smoke_20260316/train_exp1_topk_listwise_token_alignment_v1.py \
++  --stage 3 \
++  --dataset "${DATASET}" \
++  --corpus "${CORPUS}" \
++  --output-dir "${STAGE3_DIR}" \
++  --init "${STAGE3_INIT}" \
++  --device "${DEVICE}" \
++  --epochs 12 \
++  --batch-size "${BATCH_SIZE}" \
++  --lr 2e-4 \
++  --weight-decay 1e-4 \
++  --text-backbone "${TEXT_BACKBONE}" \
++  --qwen-path "${QWEN_PATH}" \
++  --feature-mode "${FEATURE_MODE}" \
++  --quality-aware-fusion \
++  --quality-drop-prob 0.10
++
++"${PYTHON_PATH}" experiments_smoke_20260316/train_exp1_topk_listwise_token_alignment_v1.py \
++  --stage 4 \
++  --dataset "${DATASET}" \
++  --corpus "${CORPUS}" \
++  --output-dir "${STAGE4_DIR}" \
++  --init "${STAGE3_DIR}/best.pt" \
++  --device "${DEVICE}" \
++  --epochs 12 \
++  --batch-size "${BATCH_SIZE}" \
++  --lr 2e-4 \
++  --weight-decay 1e-4 \
++  --text-backbone "${TEXT_BACKBONE}" \
++  --qwen-path "${QWEN_PATH}" \
++  --feature-mode "${FEATURE_MODE}" \
++  --quality-aware-fusion \
++  --quality-drop-prob 0.10 \
++  --pool attn

@@ -1,0 +1,411 @@
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/modality_evidence_topk_v2.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/modality_evidence_topk_v2.py
+new file mode 100644
+index 0000000..46f6588
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/modality_evidence_topk_v2.py
+@@ -0,0 +1,163 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Iterable
++
++MODALITY_ORDER = ["position", "electrical", "thermal", "vibration"]
++
++
++@dataclass(frozen=True)
++class ScenarioModalityPrior:
++    primary: tuple[str, ...]
++    support: tuple[str, ...]
++    note: str = ""
++
++
++SCENARIO_MODALITY_PRIORS_V2: dict[str, ScenarioModalityPrior] = {
++    "normal": ScenarioModalityPrior(
++        primary=("position", "electrical", "thermal", "vibration"),
++        support=(),
++        note="Normal samples should remain approximately balanced across modalities.",
++    ),
++    "load_disturbance_severe": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Load disturbance should first appear in tracking/position, with electrical effort as support.",
++    ),
++    "load_disturbance_mild": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Mild load disturbance still mainly manifests in tracking deviation.",
++    ),
++    "position_sensor_bias": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Position bias is directly visible in position-related feedback.",
++    ),
++    "speed_sensor_scale": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Speed-scale mismatch propagates into motion/position consistency.",
++    ),
++    "motor_encoder_freeze": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Encoder freeze is primarily a motion/feedback phenomenon.",
++    ),
++    "backlash_growth": ScenarioModalityPrior(
++        primary=("position",),
++        support=("vibration", "electrical"),
++        note="Backlash first shows through reversal dead-zone and position inconsistency.",
++    ),
++    "jam_fault": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Hard jams collapse motion first; electrical effort is support evidence.",
++    ),
++    "intermittent_jam_fault": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical", "vibration"),
++        note="Intermittent jams appear in motion collapse bursts with support from actuation and vibration.",
++    ),
++    "bearing_defect": ScenarioModalityPrior(
++        primary=("vibration",),
++        support=("electrical",),
++        note="Bearing defects should be vibration-led, with electrical disturbance as support.",
++    ),
++    "winding_resistance_rise": ScenarioModalityPrior(
++        primary=("electrical",),
++        support=("thermal",),
++        note="Electrical variables dominate, while thermal accumulation provides support.",
++    ),
++    "bus_voltage_sag_fault": ScenarioModalityPrior(
++        primary=("electrical",),
++        support=("position",),
++        note="Bus sag is first an electrical shortage, then a tracking limitation.",
++    ),
++    "inverter_voltage_loss": ScenarioModalityPrior(
++        primary=("electrical",),
++        support=("position",),
++        note="Inverter voltage loss is primarily electrical with downstream motion effects.",
++    ),
++    "partial_demagnetization": ScenarioModalityPrior(
++        primary=("electrical",),
++        support=("thermal", "position"),
++        note="Demagnetization first affects flux/electrical conversion, with thermal and tracking support.",
++    ),
++    "current_sensor_bias": ScenarioModalityPrior(
++        primary=("electrical",),
++        support=("position",),
++        note="Sensor bias is electrical-primary but may propagate to motion inconsistency.",
++    ),
++    "thermal_saturation": ScenarioModalityPrior(
++        primary=("thermal",),
++        support=("electrical",),
++        note="Thermal saturation should be temperature-led with electrical derating support.",
++    ),
++    "friction_wear_mild": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical",),
++        note="Mild friction is better represented as motion/tracking degradation with electrical support.",
++    ),
++    "friction_wear_severe": ScenarioModalityPrior(
++        primary=("position",),
++        support=("electrical", "vibration"),
++        note="Severe friction remains motion-primary with stronger electrical and vibration support.",
++    ),
++}
++
++
++def normalize_scenario_name(name: str) -> str:
++    text = str(name).strip().lower().replace(" ", "_")
++    return text
++
++
++def normalize_modality_name(name: str) -> str:
++    text = str(name).strip().lower().replace("-", "_")
++    mapping = {
++        "pos": "position",
++        "position": "position",
++        "electrical": "electrical",
++        "elec": "electrical",
++        "thermal": "thermal",
++        "therm": "thermal",
++        "vibration": "vibration",
++        "vib": "vibration",
++    }
++    return mapping.get(text, text)
++
++
++def get_prior_for_scenario(name: str) -> ScenarioModalityPrior:
++    key = normalize_scenario_name(name)
++    if key in SCENARIO_MODALITY_PRIORS_V2:
++        return SCENARIO_MODALITY_PRIORS_V2[key]
++    return ScenarioModalityPrior(primary=("position", "electrical"), support=("thermal", "vibration"), note="Fallback prior.")
++
++
++def topk_contains(topk_modalities: Iterable[str], wanted: Iterable[str]) -> bool:
++    topk_norm = {normalize_modality_name(x) for x in topk_modalities}
++    wanted_norm = {normalize_modality_name(x) for x in wanted}
++    return bool(topk_norm & wanted_norm)
++
++
++def weighted_consistency_at_3(rank_modalities: list[str], prior: ScenarioModalityPrior) -> float:
++    rank_weights = [1.0, 0.6, 0.3]
++    total = 0.0
++    for i, modality in enumerate(rank_modalities[:3]):
++        norm = normalize_modality_name(modality)
++        if norm in {normalize_modality_name(x) for x in prior.primary}:
++            total += 1.0 * rank_weights[i]
++        elif norm in {normalize_modality_name(x) for x in prior.support}:
++            total += 0.6 * rank_weights[i]
++    return float(total)
++
++
++def attention_entropy(probabilities: list[float]) -> float:
++    import math
++
++    vals = [max(float(x), 1.0e-12) for x in probabilities]
++    s = sum(vals)
++    if s <= 0.0:
++        return 0.0
++    probs = [v / s for v in vals]
++    return float(-sum(p * math.log(p) for p in probs))
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/analyze_modality_evidence_topk.py b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/analyze_modality_evidence_topk.py
+new file mode 100644
+index 0000000..3b08d12
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/analyze_modality_evidence_topk.py
+@@ -0,0 +1,203 @@
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++from modality_evidence_topk_v2 import (
++    MODALITY_ORDER,
++    attention_entropy,
++    get_prior_for_scenario,
++    normalize_modality_name,
++    normalize_scenario_name,
++    topk_contains,
++    weighted_consistency_at_3,
++)
++
++VIEWS = ["evidence", "mechanism"]
++
++
++def _find_scenario(row: dict[str, str]) -> str:
++    candidates = [
++        "true_class_name",
++        "target_result",
++        "scenario",
++        "target_class_name",
++        "true_label_name",
++        "label_name",
++    ]
++    for key in candidates:
++        value = row.get(key, "").strip()
++        if value:
++            return value
++    return "unknown"
++
++
++def _find_sample_index(row: dict[str, str], default_index: int) -> str:
++    for key in ["sample_index", "index", "row_index"]:
++        value = row.get(key, "").strip()
++        if value:
++            return value
++    return str(default_index)
++
++
++def _candidate_keys(view: str, modality: str) -> list[str]:
++    return [
++        f"{view}_{modality}_score",
++        f"{view}_score_{modality}",
++        f"score_{view}_{modality}",
++        f"{modality}_{view}_score",
++        f"{view}_{modality}",
++        f"{modality}_{view}",
++    ]
++
++
++def _extract_scores(row: dict[str, str], view: str) -> dict[str, float] | None:
++    lowered = {k.lower(): v for k, v in row.items()}
++    found: dict[str, float] = {}
++    for modality in MODALITY_ORDER:
++        value = None
++        for key in _candidate_keys(view, modality):
++            if key in lowered and str(lowered[key]).strip() != "":
++                value = lowered[key]
++                break
++        if value is None:
++            return None
++        found[modality] = float(value)
++    return found
++
++
++def _rank_modalities(scores: dict[str, float]) -> list[str]:
++    return [k for k, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)]
++
++
++def analyze_rows(rows: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
++    sample_rows: list[dict[str, Any]] = []
++    per_view_stats: dict[str, dict[str, list[float]]] = {view: defaultdict(list) for view in VIEWS}
++    per_class_view_stats: dict[str, dict[str, dict[str, list[float]]]] = defaultdict(lambda: {view: defaultdict(list) for view in VIEWS})
++    normal_entropy: dict[str, list[float]] = defaultdict(list)
++
++    for idx, row in enumerate(rows):
++        scenario = _find_scenario(row)
++        scenario_key = normalize_scenario_name(scenario)
++        prior = get_prior_for_scenario(scenario)
++        record: dict[str, Any] = {
++            "sample_index": _find_sample_index(row, idx),
++            "scenario": scenario,
++            "scenario_key": scenario_key,
++            "primary_modalities": list(prior.primary),
++            "support_modalities": list(prior.support),
++        }
++
++        for view in VIEWS:
++            scores = _extract_scores(row, view)
++            if scores is None:
++                continue
++            rank_modalities = _rank_modalities(scores)
++            probs = [scores[m] for m in MODALITY_ORDER]
++            record[f"{view}_top1"] = rank_modalities[0]
++            record[f"{view}_top2"] = ",".join(rank_modalities[:2])
++            record[f"{view}_top3"] = ",".join(rank_modalities[:3])
++            record[f"{view}_primary_in_top2"] = int(topk_contains(rank_modalities[:2], prior.primary))
++            record[f"{view}_primary_in_top3"] = int(topk_contains(rank_modalities[:3], prior.primary))
++            record[f"{view}_primary_or_support_hit_at_2"] = int(topk_contains(rank_modalities[:2], list(prior.primary) + list(prior.support)))
++            record[f"{view}_primary_or_support_hit_at_3"] = int(topk_contains(rank_modalities[:3], list(prior.primary) + list(prior.support)))
++            record[f"{view}_weighted_consistency_at_3"] = weighted_consistency_at_3(rank_modalities[:3], prior)
++            record[f"{view}_attention_entropy"] = attention_entropy(probs)
++
++            per_view_stats[view]["primary_in_top2"].append(float(record[f"{view}_primary_in_top2"]))
++            per_view_stats[view]["primary_in_top3"].append(float(record[f"{view}_primary_in_top3"]))
++            per_view_stats[view]["primary_or_support_hit_at_2"].append(float(record[f"{view}_primary_or_support_hit_at_2"]))
++            per_view_stats[view]["primary_or_support_hit_at_3"].append(float(record[f"{view}_primary_or_support_hit_at_3"]))
++            per_view_stats[view]["weighted_consistency_at_3"].append(float(record[f"{view}_weighted_consistency_at_3"]))
++            if scenario_key == "normal":
++                normal_entropy[view].append(float(record[f"{view}_attention_entropy"]))
++            else:
++                per_class_view_stats[scenario_key][view]["primary_in_top2"].append(float(record[f"{view}_primary_in_top2"]))
++                per_class_view_stats[scenario_key][view]["primary_or_support_hit_at_2"].append(float(record[f"{view}_primary_or_support_hit_at_2"]))
++                per_class_view_stats[scenario_key][view]["weighted_consistency_at_3"].append(float(record[f"{view}_weighted_consistency_at_3"]))
++
++        sample_rows.append(record)
++
++    def _mean(xs: list[float]) -> float:
++        return float(sum(xs) / len(xs)) if xs else 0.0
++
++    summary: dict[str, Any] = {
++        "views": {},
++        "per_class_fault_only": {},
++        "normal": {},
++        "modality_order": list(MODALITY_ORDER),
++        "notes": {
++            "fault_only": "Per-class metrics exclude normal from fault evidence consistency.",
++            "normal": "Normal is tracked with attention entropy instead of top-k hit logic.",
++        },
++    }
++
++    for view in VIEWS:
++        stats = per_view_stats[view]
++        summary["views"][view] = {
++            "primary_in_top2": _mean(stats["primary_in_top2"]),
++            "primary_in_top3": _mean(stats["primary_in_top3"]),
++            "primary_or_support_hit_at_2": _mean(stats["primary_or_support_hit_at_2"]),
++            "primary_or_support_hit_at_3": _mean(stats["primary_or_support_hit_at_3"]),
++            "weighted_consistency_at_3": _mean(stats["weighted_consistency_at_3"]),
++        }
++        summary["normal"][view] = {
++            "attention_entropy": _mean(normal_entropy[view]),
++            "sample_count": len(normal_entropy[view]),
++        }
++
++    for scenario_key, scenario_stats in per_class_view_stats.items():
++        summary["per_class_fault_only"][scenario_key] = {}
++        for view in VIEWS:
++            metrics = scenario_stats[view]
++            summary["per_class_fault_only"][scenario_key][view] = {
++                "primary_in_top2": _mean(metrics["primary_in_top2"]),
++                "primary_or_support_hit_at_2": _mean(metrics["primary_or_support_hit_at_2"]),
++                "weighted_consistency_at_3": _mean(metrics["weighted_consistency_at_3"]),
++                "sample_count": len(metrics["primary_in_top2"]),
++            }
++
++    return sample_rows, summary
++
++
++def write_outputs(output_dir: Path, sample_rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
++    output_dir.mkdir(parents=True, exist_ok=True)
++    csv_path = output_dir / "test_modality_evidence_topk_scores_v2.csv"
++    json_path = output_dir / "test_modality_evidence_topk_summary_v2.json"
++
++    fieldnames: list[str] = []
++    seen: set[str] = set()
++    for row in sample_rows:
++        for key in row.keys():
++            if key not in seen:
++                seen.add(key)
++                fieldnames.append(key)
++
++    with csv_path.open("w", encoding="utf-8", newline="") as f:
++        writer = csv.DictWriter(f, fieldnames=fieldnames)
++        writer.writeheader()
++        writer.writerows(sample_rows)
++
++    json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
++    print(f"topk_csv={csv_path}")
++    print(f"topk_summary={json_path}")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--scores-csv", type=Path, required=True)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    args = parser.parse_args()
++
++    with args.scores_csv.open("r", encoding="utf-8", newline="") as f:
++        rows = list(csv.DictReader(f))
++    sample_rows, summary = analyze_rows(rows)
++    write_outputs(args.output_dir, sample_rows, summary)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_evidence_mechanism_topk_v2.sh b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_evidence_mechanism_topk_v2.sh
+new file mode 100644
+index 0000000..24391e8
+--- /dev/null
++++ b/ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_evidence_mechanism_topk_v2.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++PYTHON_PATH="${PYTHON_PATH:-python3}"
++PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
++cd "${PROJECT_ROOT}"
++
++export PYTHONUNBUFFERED=1
++export PYTHONPATH=.
++
++ROUND23_ROOT="${ROUND23_ROOT:-${PROJECT_ROOT}/experiments_smoke_20260316/models/exp1_evidence_mechanism_primary_alignment_v1}"
++STAGE3_DIR="${STAGE3_DIR:-${ROUND23_ROOT}/stage3_fault_aware_multiview}"
++STAGE4_DIR="${STAGE4_DIR:-${ROUND23_ROOT}/stage4_fault_aware_multiview_llm}"
++
++for target in "${STAGE3_DIR}" "${STAGE4_DIR}"; do
++  scores_csv="${target}/test_modality_evidence_scores.csv"
++  if [[ ! -f "${scores_csv}" ]]; then
++    echo "Missing input CSV: ${scores_csv}" >&2
++    exit 1
++  fi
++  echo "[analyze] ${scores_csv}"
++  "${PYTHON_PATH}" experiments_smoke_20260316/analyze_modality_evidence_topk.py \
++    --scores-csv "${scores_csv}" \
++    --output-dir "${target}"
++done
++
++printf 'done\n'

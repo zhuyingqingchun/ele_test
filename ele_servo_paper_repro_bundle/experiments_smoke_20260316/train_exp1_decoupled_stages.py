@@ -27,6 +27,8 @@ from experiments_smoke_20260316.exp1_decoupled_models import (
     Stage2DecoupledClassifier,
     Stage3DecoupledClassifier,
     Stage4DecoupledClassifier,
+    Stage3DecoupledClassifierWithFaultAware,
+    Stage4DecoupledClassifierWithFaultAware,
 )
 
 
@@ -406,11 +408,21 @@ def build_text_cache(
         text_encoder = MockFrozenTextEncoder(hidden_size=768)
         text_dim = int(text_encoder.hidden_size)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = output_dir / f"text_embeddings__{text_backbone}.pt"
+    cache_path = output_dir / f"text_embeddings_views__{text_backbone}.pt"
     if cache_path.exists():
         return torch.load(cache_path, map_location="cpu", weights_only=False), text_dim
-    texts = [getattr(r, "texts", {}).get("combined_text", "") or getattr(r, "text", "") for r in records]
-    cache = text_encoder.encode_texts(texts, batch_size=text_batch_size)
+    view_texts: dict[str, list[str]] = {"combined": [], "evidence": [], "mechanism": [], "contrast": []}
+    for r in records:
+        texts = getattr(r, "texts", {}) or {}
+        combined = texts.get("combined_text", "") or getattr(r, "text", "")
+        view_texts["combined"].append(str(combined))
+        view_texts["evidence"].append(str(texts.get("evidence_text", combined)))
+        view_texts["mechanism"].append(str(texts.get("mechanism_text", combined)))
+        view_texts["contrast"].append(str(texts.get("contrast_text", combined)))
+    cache = {
+        key: text_encoder.encode_texts(value, batch_size=text_batch_size)
+        for key, value in view_texts.items()
+    }
     torch.save(cache, cache_path)
     return cache, text_dim
 
@@ -445,12 +457,13 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
     all_sample_indices = []
     all_quality_gates = []
     all_branch_energies = []
+    all_modality_embeddings = []
     with torch.no_grad():
         for batch in loader:
             if isinstance(batch, tuple):
                 batch, recs = batch
                 idx = torch.as_tensor([int(r.index) for r in recs], dtype=torch.long)
-                text_emb = text_cache[idx].to(device)
+                text_emb = text_cache[idx].to(device) if not isinstance(text_cache, dict) else text_cache["combined"][idx].to(device)
             else:
                 text_emb = None
             batch = move_batch_to_device(batch, device)
@@ -476,6 +489,8 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
                     all_quality_gates.extend(outputs.quality_gates.cpu().numpy().tolist())
                 if getattr(outputs, "branch_energies", None) is not None:
                     all_branch_energies.extend(outputs.branch_energies.cpu().numpy().tolist())
+                if getattr(outputs, "modality_embeddings", None) is not None:
+                    all_modality_embeddings.extend(outputs.modality_embeddings.cpu().numpy().tolist())
     result = {
         "loss": loss_sum / max(1, total),
         "scenario_accuracy": correct / max(1, total),
@@ -488,6 +503,7 @@ def evaluate(model, loader, device: torch.device, *, text_cache=None, label_smoo
         result["sample_indices"] = all_sample_indices
         result["quality_gates"] = all_quality_gates
         result["branch_energies"] = all_branch_energies
+        result["modality_embeddings"] = all_modality_embeddings
     return result
 
 
@@ -547,6 +563,13 @@ def main() -> None:
     parser.add_argument("--zero-electrical", action="store_true")
     parser.add_argument("--zero-thermal", action="store_true")
     parser.add_argument("--zero-vibration", action="store_true")
+    # Round 20: Fault-aware gate and multi-view alignment
+    parser.add_argument("--fault-aware-gate", action="store_true")
+    parser.add_argument("--fault-gate-hidden-dim", type=int, default=128)
+    parser.add_argument("--multiview-alignment", action="store_true")
+    parser.add_argument("--lambda-modality-align", type=float, default=0.15)
+    parser.add_argument("--lambda-gate-prior", type=float, default=0.10)
+    parser.add_argument("--export-counterfactual", action="store_true")
     args = parser.parse_args()
 
     torch.manual_seed(int(args.seed))
@@ -621,33 +644,71 @@ def main() -> None:
             quality_min_gate=float(args.quality_min_gate),
         ).to(device)
     elif int(args.stage) == 3:
-        model = Stage3DecoupledClassifier(
-            input_dims,
-            num_classes,
-            text_dim=int(text_dim),
-            model_dim=int(args.model_dim),
-            token_dim=int(args.token_dim),
-            quality_aware_fusion=bool(args.quality_aware_fusion),
-            quality_hidden_dim=int(args.quality_hidden_dim),
-            modality_drop_prob=float(args.quality_drop_prob),
-            quality_min_gate=float(args.quality_min_gate),
-        ).to(device)
+        # Use fault-aware version if enabled
+        if bool(args.fault_aware_gate) or bool(args.multiview_alignment):
+            model = Stage3DecoupledClassifierWithFaultAware(
+                input_dims,
+                num_classes,
+                text_dim=int(text_dim),
+                model_dim=int(args.model_dim),
+                token_dim=int(args.token_dim),
+                quality_aware_fusion=bool(args.quality_aware_fusion),
+                quality_hidden_dim=int(args.quality_hidden_dim),
+                modality_drop_prob=float(args.quality_drop_prob),
+                quality_min_gate=float(args.quality_min_gate),
+                fault_aware_gate=bool(args.fault_aware_gate),
+                fault_gate_hidden_dim=int(args.fault_gate_hidden_dim),
+                multiview_alignment=bool(args.multiview_alignment),
+            ).to(device)
+        else:
+            model = Stage3DecoupledClassifier(
+                input_dims,
+                num_classes,
+                text_dim=int(text_dim),
+                model_dim=int(args.model_dim),
+                token_dim=int(args.token_dim),
+                quality_aware_fusion=bool(args.quality_aware_fusion),
+                quality_hidden_dim=int(args.quality_hidden_dim),
+                modality_drop_prob=float(args.quality_drop_prob),
+                quality_min_gate=float(args.quality_min_gate),
+            ).to(device)
     else:
-        model = Stage4DecoupledClassifier(
-            input_dims,
-            num_classes,
-            text_dim=int(text_dim),
-            model_dim=int(args.model_dim),
-            token_dim=int(args.token_dim),
-            num_layers=int(args.llm_layers),
-            nhead=int(args.llm_heads),
-            dim_feedforward=int(args.llm_ff),
-            pool=str(args.pool),
-            quality_aware_fusion=bool(args.quality_aware_fusion),
-            quality_hidden_dim=int(args.quality_hidden_dim),
-            modality_drop_prob=float(args.quality_drop_prob),
-            quality_min_gate=float(args.quality_min_gate),
-        ).to(device)
+        # Use fault-aware version if enabled
+        if bool(args.fault_aware_gate) or bool(args.multiview_alignment):
+            model = Stage4DecoupledClassifierWithFaultAware(
+                input_dims,
+                num_classes,
+                text_dim=int(text_dim),
+                model_dim=int(args.model_dim),
+                token_dim=int(args.token_dim),
+                num_layers=int(args.llm_layers),
+                nhead=int(args.llm_heads),
+                dim_feedforward=int(args.llm_ff),
+                pool=str(args.pool),
+                quality_aware_fusion=bool(args.quality_aware_fusion),
+                quality_hidden_dim=int(args.quality_hidden_dim),
+                modality_drop_prob=float(args.quality_drop_prob),
+                quality_min_gate=float(args.quality_min_gate),
+                fault_aware_gate=bool(args.fault_aware_gate),
+                fault_gate_hidden_dim=int(args.fault_gate_hidden_dim),
+                multiview_alignment=bool(args.multiview_alignment),
+            ).to(device)
+        else:
+            model = Stage4DecoupledClassifier(
+                input_dims,
+                num_classes,
+                text_dim=int(text_dim),
+                model_dim=int(args.model_dim),
+                token_dim=int(args.token_dim),
+                num_layers=int(args.llm_layers),
+                nhead=int(args.llm_heads),
+                dim_feedforward=int(args.llm_ff),
+                pool=str(args.pool),
+                quality_aware_fusion=bool(args.quality_aware_fusion),
+                quality_hidden_dim=int(args.quality_hidden_dim),
+                modality_drop_prob=float(args.quality_drop_prob),
+                quality_min_gate=float(args.quality_min_gate),
+            ).to(device)
 
     if args.init is not None:
         load_init(model, args.init)
@@ -674,7 +735,7 @@ def main() -> None:
             if isinstance(batch, tuple):
                 batch, recs = batch
                 idx = torch.as_tensor([int(r.index) for r in recs], dtype=torch.long)
-                text_emb = text_cache[idx].to(device)
+                text_emb = text_cache[idx].to(device) if not isinstance(text_cache, dict) else text_cache["combined"][idx].to(device)
             else:
                 text_emb = None
             batch = move_batch_to_device(batch, device)
@@ -773,6 +834,15 @@ def main() -> None:
             args.output_dir,
             test_results,
             arrays["class_names"],
+        )
+    # Export modality-evidence alignment analysis for Stage 3/4
+    if args.stage in (3, 4) and test_results.get("modality_embeddings"):
+        _export_modality_evidence_alignment_analysis(
+            args.output_dir,
+            test_results,
+            arrays["class_names"],
+            text_cache,
+            token_dim=args.token_dim,
         )
 
 
@@ -876,6 +946,182 @@ def _export_quality_gate_analysis(
     summary_path = output_dir / "test_quality_gate_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"quality_gate_summary={summary_path}")
+
+
+TEXT_VIEW_NAMES = ["combined", "evidence", "mechanism", "contrast"]
+
+
+def _safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1.0e-12:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def _expected_primary_modality(class_name: str) -> str:
+    from servo_llm_alignment.text_templates import PRIMARY_MODALITY_BY_SCENARIO
+    return PRIMARY_MODALITY_BY_SCENARIO.get(class_name, "balanced")
+
+
+def _support_modalities(class_name: str) -> list[str]:
+    from servo_llm_alignment.text_templates import SUPPORT_MODALITIES_BY_SCENARIO
+    return list(SUPPORT_MODALITIES_BY_SCENARIO.get(class_name, []))
+
+
+def _export_modality_evidence_alignment_analysis(
+    output_dir: Path,
+    test_results: dict,
+    class_names: np.ndarray,
+    text_cache,
+    token_dim: int = 256,
+) -> None:
+    import csv
+
+    if not isinstance(text_cache, dict):
+        return
+
+    modality_embeddings = np.asarray(test_results.get("modality_embeddings", []), dtype=np.float32)
+    if modality_embeddings.size == 0:
+        return
+
+    sample_indices = np.asarray(test_results.get("sample_indices", []), dtype=np.int64)
+    predictions = np.asarray(test_results.get("predictions", []), dtype=np.int64)
+    targets = np.asarray(test_results.get("targets", []), dtype=np.int64)
+
+    view_arrays_raw = {
+        key: value.cpu().numpy() if hasattr(value, "cpu") else np.asarray(value)
+        for key, value in text_cache.items()
+        if key in TEXT_VIEW_NAMES
+    }
+    if "combined" not in view_arrays_raw:
+        return
+
+    # Project text embeddings to token_dim using the same projection as the model
+    text_dim = view_arrays_raw["combined"].shape[-1]
+    if text_dim != token_dim:
+        # Simple linear projection without LayerNorm/GELU for export (same as model's text_proj)
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        device = torch.device("cpu")
+        text_proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, token_dim),
+            nn.GELU(),
+        ).to(device).eval()
+        view_arrays = {}
+        with torch.no_grad():
+            for key, arr in view_arrays_raw.items():
+                tensor = torch.from_numpy(arr).float().to(device)
+                projected = text_proj(tensor)
+                normalized = F.normalize(projected, dim=-1)
+                view_arrays[key] = normalized.cpu().numpy()
+    else:
+        view_arrays = view_arrays_raw
+
+    per_class_scores: dict[str, dict[str, list[np.ndarray]]] = {}
+    evidence_primary_hits: list[int] = []
+    mechanism_support_hits: list[int] = []
+    mech_evidence_hits: list[int] = []
+    mech_mechanism_hits: list[int] = []
+
+    csv_path = output_dir / "test_modality_evidence_scores.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = [
+            "sample_index",
+            "true_class",
+            "pred_class",
+            "true_class_name",
+            "pred_class_name",
+            "expected_primary_modality",
+            "supporting_modalities",
+        ]
+        for view in TEXT_VIEW_NAMES:
+            for modality in BRANCH_NAMES:
+                header.append(f"{view}_{modality}_score")
+            header.append(f"{view}_top_modality")
+        writer.writerow(header)
+
+        for i, sample_index in enumerate(sample_indices.tolist()):
+            class_name = str(class_names[int(targets[i])])
+            pred_name = str(class_names[int(predictions[i])])
+            primary_modality = _expected_primary_modality(class_name)
+            support_modalities = _support_modalities(class_name)
+            allowed_modalities = {primary_modality, *support_modalities}
+            sample_scores: dict[str, np.ndarray] = {}
+            row = [
+                int(sample_index),
+                int(targets[i]),
+                int(predictions[i]),
+                class_name,
+                pred_name,
+                primary_modality,
+                "|".join(support_modalities),
+            ]
+            for view in TEXT_VIEW_NAMES:
+                text_vec = view_arrays.get(view, view_arrays["combined"])[int(sample_index)]
+                scores = np.array([
+                    _safe_cosine(modality_embeddings[i, j], text_vec) for j in range(len(BRANCH_NAMES))
+                ], dtype=np.float32)
+                sample_scores[view] = scores
+                row.extend([f"{float(v):.6f}" for v in scores.tolist()])
+                row.append(BRANCH_NAMES[int(scores.argmax())])
+            writer.writerow(row)
+
+            bucket = per_class_scores.setdefault(
+                class_name,
+                {view: [] for view in TEXT_VIEW_NAMES},
+            )
+            for view in TEXT_VIEW_NAMES:
+                bucket[view].append(sample_scores[view])
+
+            evidence_top = BRANCH_NAMES[int(sample_scores["evidence"].argmax())]
+            mechanism_top = BRANCH_NAMES[int(sample_scores["mechanism"].argmax())]
+            evidence_hit = int(primary_modality in BRANCH_NAMES and evidence_top == primary_modality)
+            mechanism_hit = int(primary_modality in BRANCH_NAMES and mechanism_top in allowed_modalities)
+            evidence_primary_hits.append(evidence_hit)
+            mechanism_support_hits.append(mechanism_hit)
+
+            family = FAMILY_BY_SCENARIO.get(class_name.lower(), "")
+            if family in MECHANICAL_RELATED_FAMILIES:
+                mech_evidence_hits.append(evidence_hit)
+                mech_mechanism_hits.append(mechanism_hit)
+
+    summary = {
+        "branch_names": BRANCH_NAMES,
+        "views": TEXT_VIEW_NAMES,
+        "overall": {
+            "evidence_primary_hit_rate": _mean_or_nan(evidence_primary_hits),
+            "mechanism_primary_or_support_hit_rate": _mean_or_nan(mechanism_support_hits),
+        },
+        "mechanical_related": {
+            "sample_count": len(mech_evidence_hits),
+            "evidence_primary_hit_rate": _mean_or_nan(mech_evidence_hits),
+            "mechanism_primary_or_support_hit_rate": _mean_or_nan(mech_mechanism_hits),
+        },
+        "per_class": {},
+    }
+
+    for class_name, view_map in per_class_scores.items():
+        summary["per_class"][class_name] = {
+            "primary_modality": _expected_primary_modality(class_name),
+            "supporting_modalities": _support_modalities(class_name),
+            "sample_count": len(view_map["combined"]),
+            "mean_scores": {},
+            "top_modality": {},
+        }
+        for view, rows in view_map.items():
+            stacked = np.stack(rows, axis=0)
+            mean_scores = stacked.mean(axis=0)
+            summary["per_class"][class_name]["mean_scores"][view] = {
+                BRANCH_NAMES[i]: float(mean_scores[i]) for i in range(len(BRANCH_NAMES))
+            }
+            summary["per_class"][class_name]["top_modality"][view] = BRANCH_NAMES[int(mean_scores.argmax())]
+
+    summary_path = output_dir / "test_modality_evidence_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"modality_evidence_summary={summary_path}")
 
 
 if __name__ == "__main__":
