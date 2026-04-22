@@ -50,6 +50,37 @@ ele_servo_new/
 
 ## 更新记录
 
+### Round 39 (2025-04-22) - Token-Level Evidence Alignment v1
+
+**突破性成果**：Token 级细粒度对齐，99.98% 准确率 + 100% 对齐
+
+#### 新增文件
+- `ele_servo_paper_repro_bundle/experiments_smoke_20260316/token_evidence_alignment_v1_utils.py` - Token 传输与质量统计
+- `ele_servo_paper_repro_bundle/experiments_smoke_20260316/exp1_stage4_token_evidence_alignment_v1_models.py` - Stage 4 Token 对齐模型
+- `ele_servo_paper_repro_bundle/experiments_smoke_20260316/train_exp1_stage4_token_evidence_alignment_v1.py` - Token 级训练脚本
+- `ele_servo_paper_repro_bundle/experiments_smoke_20260316/run_exp1_stage4_token_evidence_alignment_v1.sh` - Stage 4 运行脚本
+
+#### 核心技术创新（Token-Level）
+| 技术 | 说明 | 效果 |
+|------|------|------|
+| `token_transport_plan` | Signal tokens → Evidence/Mechanism views | 细粒度 token-text 对齐 |
+| `token_primary_support_loss` | Token 级模态排序损失 | Primary > Support > Others |
+| Token Mass 统计 | 按模态聚合 token 质量 | Position 50.88%, Electrical 35.38% |
+| Token Entropy 监控 | 对齐集中度指标 | 2.67 → 1.64（更集中） |
+
+#### 实验结果
+| 指标 | 数值 |
+|------|------|
+| 测试准确率 | **99.98%** (2,547 fault samples) |
+| Evidence Primary @ Top2 | **99.92%** |
+| Evidence Primary @ Top3 | **100%** |
+| Evidence Primary/Support @ Top3 | **100%** |
+
+#### 困难类突破（全部 100% 对齐）
+- `friction_wear_mild/severe`: ✅ 100%
+- `current_sensor_bias`: ✅ 100%
+- `partial_demagnetization`: ✅ 100%
+
 ### Round 32 (2025-04-22) - TopK Dual-Level Alignment v2
 
 **突破性成果**：实现 100% 模态-证据对齐
